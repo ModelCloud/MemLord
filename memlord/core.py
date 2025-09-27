@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 # Hard dependency (PyPI/GitHub: modelcloud/device-smi)
-import device_smi
+from device_smi import Device
 
 from .util import (
     RESET, RED, GREEN, YELLOW, CYAN, MAGENTA,
@@ -60,7 +60,9 @@ Semantics:
 Device capacity sources:
   • CUDA: total from torch.cuda.get_device_properties(i).total_memory;
           used from max(torch.cuda.memory_reserved(i), torch.cuda.memory_allocated(i)).
-  • CPU:  via device_smi.System().memory() -> (total, used)
+  • CPU:  via device_smi.Device("cpu") object attributes/methods:
+          - .memory_total (constant capacity, bytes)
+          - .memory_used() to read current used bytes
   • Others: if unknown, "percent" thresholds are ignored; only "bytes" thresholds apply.
 """
 
@@ -369,7 +371,10 @@ class MemLord:
 
         - CUDA: total from get_device_properties.total_memory.
                 used = max(memory_reserved, memory_allocated).
-        - CPU:  via device_smi.System().memory() (total, used).
+        - CPU:  via device_smi.Device("cpu"):
+                * memory_total (constant capacity, bytes)
+                * metrics()    → refresh live metrics
+                * memory_used() → current used bytes (after metrics())
         - Others: (None, None, 0.0)
         """
         if dev.type == "cuda" and torch.cuda.is_available():
@@ -393,11 +398,9 @@ class MemLord:
                     used_pct)
 
         if dev.type == "cpu":
-            # device-smi hard dependency
-            sys = device_smi.System()
-            mem = sys.memory()            # expected attributes: total, used (bytes)
-            total = int(mem.total)
-            used = int(mem.used)
+            cpu = Device("cpu")
+            total = int(cpu.memory_total)  # capacity is static
+            used = int(cpu.memory_used())  # JIT current usage after metrics()
             used_pct = (used / total * 100.0) if total > 0 else 0.0
             return total, used, used_pct
 
