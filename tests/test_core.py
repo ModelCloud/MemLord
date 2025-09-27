@@ -136,9 +136,12 @@ def test_type_aggregation_without_index(tracker: MemLord):
     direct, _ = tracker.allocated(cpu)  # exact device (same on CPU)
     assert total_by_cpu == direct
 
-# ---------- Hotspot tracking ----------
+# ---------- Hotspot tracking (now opt-in) ----------
 
 def test_hotspot_tracks_file_line(tracker: MemLord):
+    # Call-site tracking is disabled by default. Enable it just for this test.
+    tracker.set_callsite_tracking(True)
+
     t = alloc_tensor_on("cpu", (64, 64))
     tracker.allocate(t)
     top = tracker.top_alloc_site()
