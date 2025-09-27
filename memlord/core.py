@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 import threading
-from typing import Any, Dict, Iterable, Tuple, Generator, Optional
+from typing import Dict, Iterable, Tuple, Generator, Optional
 
 import torch
 import torch.nn as nn
+
+# Hard dependency (PyPI/GitHub: modelcloud/device-smi)
+import device_smi
 
 from .util import (
     RESET, RED, GREEN, YELLOW, CYAN, MAGENTA,
@@ -23,8 +26,8 @@ ObjOrTuple = Obj | tuple[Obj, ...]
 
 
 """
-Auto-GC Strategy (stacked / banded) — Overview
------------------------------------------------
+Auto-GC Strategy (stacked / banded)
+-----------------------------------
 
 MemLord uses a configurable `auto_gc_strategy` instead of a single byte threshold.
 
@@ -43,34 +46,22 @@ Strategy shape:
 Semantics:
   • At each allocation/free (and hook variants), MemLord:
       1) Computes device usage (used/total) as a percent (used_pct).
-      2) Selects the first band (lo<=used_pct<hi) in the insertion order.
-      3) Resolves the effective threshold in bytes:
-           - Start with 0
-           - If "bytes" present → consider that value
-           - If "percent" present and total capacity known → consider total * (percent/100)
-           - Effective threshold = max(all provided components)
+      2) Selects the FIRST band (lo <= used_pct < hi) in insertion order.
+      3) Resolves the effective threshold in bytes by taking the MAX of:
+           - "bytes" (if provided)
+           - "percent" * device_total (if provided and total is known)
       4) Computes the metric value:
            - "allocated": tracked allocated bytes for device
            - "freed":     bytes freed since last successful GC (resets post-GC)
            - "max":       max(allocated, freed)
       5) If metric_value >= threshold → run backend GC.
-           On success: reset freed counter for device; increment GC counters; log details.
+         On success: reset freed counter for device; increment GC counters; log details.
 
-Notes:
-  • CPU support: If psutil is installed, we derive total/used from psutil.virtual_memory().
-                 Otherwise percent-based thresholds on CPU are ignored (only "bytes" applies).
-  • CUDA support: total from torch.cuda.get_device_properties(i).total_memory; used from
-                  max(torch.cuda.memory_reserved(i), torch.cuda.memory_allocated(i)).
-  • Other device types: if total is unknown, "percent" is ignored; only "bytes" applies.
-  • Band selection follows dict insertion order; you can control precedence by ordering.
-
-Example strategy:
-    auto_gc_strategy = {
-        (0, 25):   {"metric": "max",       "threshold": {"bytes": 1 << 20}},  # 1 MiB
-        (25, 50):  {"metric": "allocated", "threshold": {"percent": 0.50}},   # 0.50% of capacity
-        (50, 75):  {"metric": "freed",     "threshold": {"percent": 0.33}},   # 0.33% of capacity
-        (75, 101): {"metric": "max",       "threshold": {"percent": 0.25}},   # 0.25% of capacity
-    }
+Device capacity sources:
+  • CUDA: total from torch.cuda.get_device_properties(i).total_memory;
+          used from max(torch.cuda.memory_reserved(i), torch.cuda.memory_allocated(i)).
+  • CPU:  via device_smi.System().memory() -> (total, used)
+  • Others: if unknown, "percent" thresholds are ignored; only "bytes" thresholds apply.
 """
 
 
@@ -86,7 +77,7 @@ class MemLord:
       - top_alloc_site(device?): -> (device, 'file:line', bytes) | None
       - top_free_site(device?):  -> (device, 'file:line', bytes) | None
       - set_auto_gc_strategy(dict|None): replace strategy. If None, uses a default.
-      - hook_into_torch():    install hooks for Tensor/Module move + CUDA sync APIs.
+      - hook_into_torch():   install hooks for Tensor/Module move + CUDA sync APIs.
 
     Colored logs (only if DEBUG=1):
       allocate -> red, free -> green, summaries -> cyan, auto-GC/strategy -> yellow, reset -> magenta
@@ -139,7 +130,7 @@ class MemLord:
             type_counts=type_counts,
         )
 
-        # Check auto-GC after allocations (strategy-based)
+        # Strategy check post-allocation
         for dev in affected:
             self._maybe_auto_gc(dev)
 
@@ -170,6 +161,7 @@ class MemLord:
             type_counts=type_counts,
         )
 
+        # Strategy check post-free
         for dev in affected:
             self._maybe_auto_gc(dev)
 
@@ -231,7 +223,7 @@ class MemLord:
                 (75, 101): {"metric": "max", "threshold": {"percent": 0.25}},  # 0.25% of capacity
             }
 
-        # Validate shape lightly
+        # Light validation
         for k, v in strategy.items():
             if not (isinstance(k, tuple) and len(k) == 2 and all(isinstance(x, (int, float)) for x in k)):
                 raise ValueError(f"Strategy key must be (lo_pct, hi_pct), got {k}")
@@ -336,6 +328,40 @@ class MemLord:
 
         return by_dev
 
+    # ---------- Summaries ----------
+    def _all_known_devices_locked(self) -> list[torch.device]:
+        all_set = set(self._allocated_by_dev.keys()) | set(self._freed_by_dev.keys())
+        return sorted(all_set, key=lambda d: (d.type, -1 if d.index is None else d.index))
+
+    def _totals_by_type_locked(self, table: Dict[torch.device, int]) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for d, v in table.items():
+            out[d.type] = out.get(d.type, 0) + v
+        return out
+
+    def _counts_by_type_locked(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for d in set(self._allocated_by_dev.keys()) | set(self._freed_by_dev.keys()):
+            counts[d.type] = counts.get(d.type, 0) + 1
+        return counts
+
+    def _print_full_device_summary(
+        self,
+        header: str,
+        per_device_map: Dict[torch.device, int],
+        all_devices: list[torch.device],
+        type_totals: Dict[str, int],
+        type_counts: Dict[str, int],
+    ) -> None:
+        if not is_debug():
+            return
+        for dev in all_devices:
+            val = per_device_map.get(dev, 0)
+            print(f"{header} {dev}: {format_bytes(val)}")
+        for dtype in sorted(type_totals.keys()):
+            if type_counts.get(dtype, 0) > 1:
+                print(f"{header} {dtype}: {format_bytes(type_totals[dtype])}")
+
     # ---------- Device memory stats ----------
     def _device_memory_stats(self, dev: torch.device) -> Tuple[Optional[int], Optional[int], float]:
         """
@@ -343,7 +369,7 @@ class MemLord:
 
         - CUDA: total from get_device_properties.total_memory.
                 used = max(memory_reserved, memory_allocated).
-        - CPU:  total/used from psutil.virtual_memory() if available.
+        - CPU:  via device_smi.System().memory() (total, used).
         - Others: (None, None, 0.0)
         """
         if dev.type == "cuda" and torch.cuda.is_available():
@@ -367,16 +393,13 @@ class MemLord:
                     used_pct)
 
         if dev.type == "cpu":
-            try:
-                import psutil  # optional dependency
-                vm = psutil.virtual_memory()
-                total = int(vm.total)
-                used = int(total - vm.available)
-                used_pct = (used / total * 100.0) if total > 0 else 0.0
-                return total, used, used_pct
-            except Exception:
-                # psutil not present or failed; cannot compute percent capacity
-                return None, None, 0.0
+            # device-smi hard dependency
+            sys = device_smi.System()
+            mem = sys.memory()            # expected attributes: total, used (bytes)
+            total = int(mem.total)
+            used = int(mem.used)
+            used_pct = (used / total * 100.0) if total > 0 else 0.0
+            return total, used, used_pct
 
         # Non-CUDA/CPU or unknown types
         return (None, None, 0.0)

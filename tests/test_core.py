@@ -71,8 +71,8 @@ def ensure_debug_off_and_restore_env():
 
 @pytest.fixture
 def tracker():
-    # Disabled auto-GC by default to make tests deterministic
-    return MemLord(auto_gc_bytes=None)
+    # Disable auto-GC by default (empty strategy = no bands matched)
+    return MemLord(auto_gc_strategy={})
 
 # ---------- Core API: CPU-only ----------
 
@@ -156,15 +156,30 @@ def test_hotspot_tracks_file_line(tracker: MemLord):
 # ---------- Auto-GC (per-device) ----------
 
 @pytest.mark.cuda
-def test_auto_gc_runs_and_resets_freed_per_device():
+def test_auto_gc_runs_and_resets_freed_per_device(monkeypatch):
     cuda_or_skip(1)
-    tr = MemLord(auto_gc_bytes=1)  # any free triggers GC
+
+    # Strategy: single band over all usage, trigger on any freed >= 1 byte
+    strategy = {
+        (0, 101): {"metric": "freed", "threshold": {"bytes": 1}},
+    }
+    tr = MemLord(auto_gc_strategy=strategy)
     d0 = torch.device("cuda:0")
+
+    # Make GC deterministic
+    import memlord.core as core_mod
+    calls = []
+    def fake_gc(dev):
+        calls.append(dev)
+        return True
+    monkeypatch.setattr(core_mod, "_run_backend_gc", lambda d: fake_gc(d))
 
     t = alloc_tensor_on(d0, (256, 256))
     tr.allocate(t)
 
     tr.free(t)
+    # GC should have run and reset freed counter
+    assert calls == [d0]
     fr1, _ = tr.freed(d0)
     assert fr1 == 0  # reset after GC
 
@@ -302,22 +317,50 @@ def test_allocated_freed_aggregate_cuda_type(tracker: MemLord):
     freed_by_type, _ = tracker.freed(torch.device("cuda"))
     assert freed_by_type >= sum(sizes.values())
 
-# ---------- "auto" threshold derivation ----------
+# ---------- Percent threshold resolution (strategy) ----------
 
-@pytest.mark.cuda
-def test_auto_threshold_min_total_div_3():
-    cuda_or_skip(1)
-    tr = MemLord(auto_gc_bytes="auto")
-    threshold = tr._auto_gc_bytes
-    assert threshold is None or threshold >= 0
+def test_percent_threshold_band_selection_and_trigger(monkeypatch):
+    # Build a MemLord with a two-band strategy:
+    #  (0,50):   metric=max,   threshold=1024 bytes
+    #  (50,101): metric=freed, threshold=percent=0.1 of capacity
+    strategy = {
+        (0, 50):   {"metric": "max",   "threshold": {"bytes": 1024}},
+        (50, 101): {"metric": "freed", "threshold": {"percent": 0.1}},
+    }
+    tr = MemLord(auto_gc_strategy=strategy)
+    dev = torch.device("cpu")
 
-    if threshold is not None:
-        totals = []
-        for i in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(i)
-            totals.append(int(getattr(props, "total_memory", 0)))
-        expected = min(totals) // 3
-        assert threshold == expected
+    # Monkeypatch backend GC to be deterministic
+    import memlord.core as core_mod
+    calls = []
+    def fake_gc(d):
+        calls.append(d)
+        return True
+    monkeypatch.setattr(core_mod, "_run_backend_gc", lambda d: fake_gc(d))
+
+    # Band A: used% = 10 -> (0,50), metric=max, threshold=1024 bytes
+    def stats_low(_dev):
+        return (10 * 1024, 1 * 1024, 10.0)  # total=10KiB, used=1KiB, used%=10
+    monkeypatch.setattr(tr, "_device_memory_stats", stats_low)
+
+    tr._allocated_by_dev[dev] = 2048  # 2KiB
+    tr._freed_by_dev[dev] = 0
+    tr._maybe_auto_gc(dev)
+    assert calls == [dev]  # triggered by band (0,50), max metric
+
+    # Band B: used% = 60 -> (50,101), metric=freed, threshold=0.1% of total
+    # For total=10KiB, 0.1% = 10 bytes; pick a small but >10 value to trigger
+    def stats_high(_dev):
+        return (10 * 1024, 6 * 1024, 60.0)
+    monkeypatch.setattr(tr, "_device_memory_stats", stats_high)
+
+    calls.clear()
+    tr._allocated_by_dev[dev] = 0
+    tr._freed_by_dev[dev] = 64
+    tr._maybe_auto_gc(dev)
+    assert calls == [dev]
+    # Freed counter should reset
+    assert tr._freed_by_dev[dev] == 0
 
 # ---------- Hook logs present when DEBUG=1 ----------
 
@@ -325,7 +368,7 @@ def test_auto_threshold_min_total_div_3():
 def test_logs_include_hook_labels_and_free_and_allocate(capsys):
     cuda_or_skip(1)
     os.environ["DEBUG"] = "1"
-    tr = MemLord(auto_gc_bytes=None)
+    tr = MemLord(auto_gc_strategy={})
     hooks = tr.hook_into_torch()
     try:
         d0 = torch.device("cuda:0")
