@@ -22,27 +22,78 @@ Obj = nn.Module | torch.Tensor
 ObjOrTuple = Obj | tuple[Obj, ...]
 
 
+"""
+Auto-GC Strategy (stacked / banded) — Overview
+-----------------------------------------------
+
+MemLord uses a configurable `auto_gc_strategy` instead of a single byte threshold.
+
+Strategy shape:
+    {
+        (lo_pct: number, hi_pct: number): {
+            "metric": "allocated" | "freed" | "max",
+            "threshold": {
+                "bytes":   int,     # absolute threshold in bytes
+                "percent": float,   # percent of device capacity (VRAM on GPU, RAM on CPU); e.g. 0.5 means 0.5%
+            }
+        },
+        ...
+    }
+
+Semantics:
+  • At each allocation/free (and hook variants), MemLord:
+      1) Computes device usage (used/total) as a percent (used_pct).
+      2) Selects the first band (lo<=used_pct<hi) in the insertion order.
+      3) Resolves the effective threshold in bytes:
+           - Start with 0
+           - If "bytes" present → consider that value
+           - If "percent" present and total capacity known → consider total * (percent/100)
+           - Effective threshold = max(all provided components)
+      4) Computes the metric value:
+           - "allocated": tracked allocated bytes for device
+           - "freed":     bytes freed since last successful GC (resets post-GC)
+           - "max":       max(allocated, freed)
+      5) If metric_value >= threshold → run backend GC.
+           On success: reset freed counter for device; increment GC counters; log details.
+
+Notes:
+  • CPU support: If psutil is installed, we derive total/used from psutil.virtual_memory().
+                 Otherwise percent-based thresholds on CPU are ignored (only "bytes" applies).
+  • CUDA support: total from torch.cuda.get_device_properties(i).total_memory; used from
+                  max(torch.cuda.memory_reserved(i), torch.cuda.memory_allocated(i)).
+  • Other device types: if total is unknown, "percent" is ignored; only "bytes" applies.
+  • Band selection follows dict insertion order; you can control precedence by ordering.
+
+Example strategy:
+    auto_gc_strategy = {
+        (0, 25):   {"metric": "max",       "threshold": {"bytes": 1 << 20}},  # 1 MiB
+        (25, 50):  {"metric": "allocated", "threshold": {"percent": 0.50}},   # 0.50% of capacity
+        (50, 75):  {"metric": "freed",     "threshold": {"percent": 0.33}},   # 0.33% of capacity
+        (75, 101): {"metric": "max",       "threshold": {"percent": 0.25}},   # 0.25% of capacity
+    }
+"""
+
+
 class MemLord:
     """
-    Tracks memory per device instance (torch.device).
+    Tracks memory per device instance (torch.device) with an auto-GC strategy.
 
     API:
       - allocate(obj|tuple): track allocations (nn.Module or torch.Tensor).
-      - free(obj|tuple):     track frees; optional auto-GC per device-index when
-                             max(allocated_bytes, freed_bytes) exceeds threshold.
+      - free(obj|tuple):     track frees; auto-GC driven by `auto_gc_strategy`.
       - allocated(device?):  -> (raw_bytes, human_str).
       - freed(device?):      -> (raw_bytes, human_str).
       - top_alloc_site(device?): -> (device, 'file:line', bytes) | None
       - top_free_site(device?):  -> (device, 'file:line', bytes) | None
-      - set_auto_gc(bytes|None|'auto'): enable/disable/change threshold. 'auto' = min visible CUDA total / 3.
-      - hook_into_torch():    install hooks for Tensor.to / Module.to / CUDA synchronize APIs.
+      - set_auto_gc_strategy(dict|None): replace strategy. If None, uses a default.
+      - hook_into_torch():    install hooks for Tensor/Module move + CUDA sync APIs.
 
     Colored logs (only if DEBUG=1):
-      allocate -> red, free -> green, summaries -> cyan, auto-GC/auto-threshold -> yellow, reset -> magenta
+      allocate -> red, free -> green, summaries -> cyan, auto-GC/strategy -> yellow, reset -> magenta
       Hook-originated updates are suffixed with "(hook)".
     """
 
-    def __init__(self, auto_gc_bytes: int | str | None = "auto") -> None:
+    def __init__(self, auto_gc_strategy: Optional[dict] = None) -> None:
         self._allocated_by_dev: Dict[torch.device, int] = {}
         self._freed_by_dev: Dict[torch.device, int] = {}
 
@@ -59,9 +110,9 @@ class MemLord:
 
         self._lock = threading.Lock()
 
-        # Set threshold
-        self._auto_gc_bytes: int | None = None
-        self._resolve_and_set_auto_gc(auto_gc_bytes, context="init")
+        # Auto-GC strategy
+        self._auto_gc_strategy: dict = {}
+        self.set_auto_gc_strategy(auto_gc_strategy)
 
     # ---------- Public API ----------
     def allocate(self, ob: ObjOrTuple) -> None:
@@ -88,10 +139,9 @@ class MemLord:
             type_counts=type_counts,
         )
 
-        # New: check auto-GC after allocations as well (using max(allocated, freed))
-        if self._auto_gc_bytes is not None and self._auto_gc_bytes > 0:
-            for dev in affected:
-                self._maybe_auto_gc(dev)
+        # Check auto-GC after allocations (strategy-based)
+        for dev in affected:
+            self._maybe_auto_gc(dev)
 
     def free(self, ob: ObjOrTuple) -> None:
         sizes = self._sizes_for_many(ob)
@@ -120,9 +170,8 @@ class MemLord:
             type_counts=type_counts,
         )
 
-        if self._auto_gc_bytes is not None and self._auto_gc_bytes > 0:
-            for dev in affected:
-                self._maybe_auto_gc(dev)
+        for dev in affected:
+            self._maybe_auto_gc(dev)
 
     def reset(self) -> None:
         with self._lock:
@@ -158,8 +207,47 @@ class MemLord:
         with self._lock:
             return _top_site_query(device, self._top_free_site)
 
-    def set_auto_gc(self, bytes_threshold: int | str | None) -> None:
-        self._resolve_and_set_auto_gc(bytes_threshold, context="set_auto_gc")
+    def set_auto_gc_strategy(self, strategy: Optional[dict]) -> None:
+        """
+        Replace the current auto-GC strategy. If None, install a reasonable default.
+
+        Strategy shape:
+            {
+                (lo_pct:int|float, hi_pct:int|float): {
+                    "metric": "allocated" | "freed" | "max",
+                    "threshold": {
+                        "bytes":   int,        # absolute
+                        "percent": float,      # percent of device capacity (VRAM on GPU, RAM on CPU)
+                    }
+                },
+                ...
+            }
+        """
+        if strategy is None:
+            # Default: thresholds scale with capacity; get stricter as usage climbs.
+            strategy = {
+                (0, 50):   {"metric": "max", "threshold": {"percent": 0.50}},  # 0.50% of capacity
+                (50, 75):  {"metric": "max", "threshold": {"percent": 0.33}},  # 0.33% of capacity
+                (75, 101): {"metric": "max", "threshold": {"percent": 0.25}},  # 0.25% of capacity
+            }
+
+        # Validate shape lightly
+        for k, v in strategy.items():
+            if not (isinstance(k, tuple) and len(k) == 2 and all(isinstance(x, (int, float)) for x in k)):
+                raise ValueError(f"Strategy key must be (lo_pct, hi_pct), got {k}")
+            metric = v.get("metric")
+            if metric not in ("allocated", "freed", "max"):
+                raise ValueError(f"Invalid metric {metric}; choose 'allocated'|'freed'|'max'")
+            thr = v.get("threshold", {})
+            if not isinstance(thr, dict) or not thr:
+                raise ValueError("Each rule must provide a non-empty 'threshold' dict")
+            if not any(k in thr for k in ("bytes", "percent")):
+                raise ValueError("Threshold must include 'bytes' and/or 'percent'")
+
+        with self._lock:
+            self._auto_gc_strategy = dict(strategy)
+
+        _log(f"{YELLOW}[set_auto_gc_strategy]{RESET} installed {len(strategy)} band(s)")
 
     def hook_into_torch(self) -> "TorchMoveHooks":
         """
@@ -174,49 +262,6 @@ class MemLord:
         hooks = TorchMoveHooks(self)
         hooks.enable()
         return hooks
-
-    # ---------- Auto threshold ----------
-    def _resolve_and_set_auto_gc(self, val: int | str | None, context: str) -> None:
-        auto_requested = (val is None) or (isinstance(val, str) and val.lower() == "auto")
-
-        if not auto_requested:
-            if not isinstance(val, int) or val < 0:
-                raise ValueError("auto_gc_bytes must be an int >= 0, 'auto', or None")
-            with self._lock:
-                self._auto_gc_bytes = val
-            _log(f"{YELLOW}[{context}]{RESET} auto_gc_bytes set to {format_bytes(val)} (explicit)")
-            return
-
-        threshold, debug_msg = self._compute_auto_threshold()
-        with self._lock:
-            self._auto_gc_bytes = threshold
-
-        if threshold is None or threshold <= 0:
-            _log(f"{YELLOW}[{context}]{RESET} auto_gc_bytes: CUDA not available; auto-GC disabled. {debug_msg}")
-        else:
-            _log(f"{YELLOW}[{context}]{RESET} auto_gc_bytes (auto): {debug_msg} -> {format_bytes(threshold)}")
-
-    def _compute_auto_threshold(self) -> tuple[int | None, str]:
-        try:
-            if not torch.cuda.is_available():
-                return None, "torch.cuda.is_available() == False"
-            count = torch.cuda.device_count()
-            if count <= 0:
-                return None, "torch.cuda.device_count() == 0"
-            totals = []
-            parts = []
-            for i in range(count):
-                props = torch.cuda.get_device_properties(i)
-                total = int(getattr(props, "total_memory", 0))
-                totals.append(total)
-                parts.append(f"{i}:{format_bytes(total)}")
-            if not totals:
-                return None, "No visible CUDA totals found"
-            min_total = min(totals)
-            threshold = min_total // 3
-            return threshold, f"visible CUDA -> [{', '.join(parts)}]; min={format_bytes(min_total)}; min/3={format_bytes(threshold)}"
-        except Exception as e:
-            return None, f"auto detection error: {e}"
 
     # ---------- Memory accounting helpers ----------
     def _sizes_for_many(self, ob: ObjOrTuple) -> Dict[torch.device, int]:
@@ -291,68 +336,132 @@ class MemLord:
 
         return by_dev
 
-    # ---------- Summaries ----------
-    def _all_known_devices_locked(self) -> list[torch.device]:
-        all_set = set(self._allocated_by_dev.keys()) | set(self._freed_by_dev.keys())
-        return sorted(all_set, key=lambda d: (d.type, -1 if d.index is None else d.index))
+    # ---------- Device memory stats ----------
+    def _device_memory_stats(self, dev: torch.device) -> Tuple[Optional[int], Optional[int], float]:
+        """
+        Returns (total_bytes, used_bytes, used_pct) for the device.
 
-    def _totals_by_type_locked(self, table: Dict[torch.device, int]) -> Dict[str, int]:
-        out: Dict[str, int] = {}
-        for d, v in table.items():
-            out[d.type] = out.get(d.type, 0) + v
+        - CUDA: total from get_device_properties.total_memory.
+                used = max(memory_reserved, memory_allocated).
+        - CPU:  total/used from psutil.virtual_memory() if available.
+        - Others: (None, None, 0.0)
+        """
+        if dev.type == "cuda" and torch.cuda.is_available():
+            idx = 0 if dev.index is None else int(dev.index)
+            try:
+                props = torch.cuda.get_device_properties(idx)
+                total = int(getattr(props, "total_memory", 0))
+            except Exception:
+                total = 0
+
+            try:
+                alloc = int(torch.cuda.memory_allocated(idx))
+                reserv = int(torch.cuda.memory_reserved(idx))
+                used = max(alloc, reserv)
+            except Exception:
+                used = 0
+
+            used_pct = (used / total * 100.0) if (total > 0) else 0.0
+            return (total if total > 0 else None,
+                    used if used > 0 else 0,
+                    used_pct)
+
+        if dev.type == "cpu":
+            try:
+                import psutil  # optional dependency
+                vm = psutil.virtual_memory()
+                total = int(vm.total)
+                used = int(total - vm.available)
+                used_pct = (used / total * 100.0) if total > 0 else 0.0
+                return total, used, used_pct
+            except Exception:
+                # psutil not present or failed; cannot compute percent capacity
+                return None, None, 0.0
+
+        # Non-CUDA/CPU or unknown types
+        return (None, None, 0.0)
+
+    # ---------- Strategy selection & evaluation ----------
+    def _select_rule_for_used_pct(self, used_pct: float) -> Optional[dict]:
+        """
+        Find the first rule whose band (lo, hi) satisfies lo <= used_pct < hi.
+        Strategy iteration order follows dict insertion order (Python 3.7+),
+        so you can control precedence by ordering the bands.
+        """
+        strat = self._auto_gc_strategy
+        for (lo, hi), rule in strat.items():
+            if used_pct >= float(lo) and used_pct < float(hi):
+                return rule
+        return None
+
+    def _resolve_threshold_bytes(self, rule: dict, dev: torch.device) -> int:
+        """
+        Resolve the rule's threshold into bytes. If multiple components are present,
+        returns the maximum. Unknown capacity => 'percent' component is ignored.
+        """
+        thr = rule.get("threshold", {})
+        out = 0
+
+        if "bytes" in thr:
+            try:
+                out = max(out, int(thr["bytes"]))
+            except Exception:
+                pass
+
+        if "percent" in thr:
+            total, _, _ = self._device_memory_stats(dev)
+            if total:
+                try:
+                    pct = float(thr["percent"])
+                    out = max(out, int(total * (pct / 100.0)))
+                except Exception:
+                    pass
+
         return out
 
-    def _counts_by_type_locked(self) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for d in set(self._allocated_by_dev.keys()) | set(self._freed_by_dev.keys()):
-            counts[d.type] = counts.get(d.type, 0) + 1
-        return counts
+    def _metric_value(self, metric: str, dev: torch.device) -> int:
+        if metric == "allocated":
+            with self._lock:
+                return self._allocated_by_dev.get(dev, 0)
+        elif metric == "freed":
+            with self._lock:
+                return self._freed_by_dev.get(dev, 0)
+        elif metric == "max":
+            with self._lock:
+                return max(self._allocated_by_dev.get(dev, 0), self._freed_by_dev.get(dev, 0))
+        else:
+            return 0
 
-    def _print_full_device_summary(
-        self,
-        header: str,
-        per_device_map: Dict[torch.device, int],
-        all_devices: list[torch.device],
-        type_totals: Dict[str, int],
-        type_counts: Dict[str, int],
-    ) -> None:
-        if not is_debug():
-            return
-        for dev in all_devices:
-            val = per_device_map.get(dev, 0)
-            print(f"{header} {dev}: {format_bytes(val)}")
-        for dtype in sorted(type_totals.keys()):
-            if type_counts.get(dtype, 0) > 1:
-                print(f"{header} {dtype}: {format_bytes(type_totals[dtype])}")
-
-    # ---------- Auto-GC (per-device only) ----------
+    # ---------- Auto-GC (per-device, strategy-driven) ----------
     def _maybe_auto_gc(self, dev: torch.device) -> None:
         """
-        Trigger GC when max(allocated_bytes, freed_bytes) for this device
-        meets/exceeds the configured threshold.
+        Apply the configured auto-GC strategy for this device.
         """
-        threshold = self._auto_gc_bytes
-        if threshold is None or threshold <= 0:
+        # 1) Compute used % (and total if available)
+        total_bytes, used_bytes, used_pct = self._device_memory_stats(dev)
+
+        # 2) Find matching rule
+        rule = self._select_rule_for_used_pct(used_pct)
+        if not rule:
             return
 
-        with self._lock:
-            current_freed = self._freed_by_dev.get(dev, 0)
-            current_alloc = self._allocated_by_dev.get(dev, 0)
+        metric = rule.get("metric", "max")
+        threshold_bytes = self._resolve_threshold_bytes(rule, dev)
 
-        # Compare using the larger of the two metrics
-        if current_freed >= current_alloc:
-            metric_name = "freed"
-            metric_val = current_freed
-        else:
-            metric_name = "allocated"
-            metric_val = current_alloc
+        if threshold_bytes <= 0:
+            # No meaningful threshold for this device/band
+            return
 
-        if metric_val < threshold:
+        # 3) Evaluate metric
+        value = self._metric_value(metric, dev)
+
+        # 4) Compare and GC
+        if value < threshold_bytes:
             return
 
         if _run_backend_gc(dev):
             with self._lock:
-                # Preserve allocated accounting; freed counter reflects bytes since last GC, so reset it.
+                # Keep allocated accounting; reset freed-after-last-GC counter.
                 self._freed_by_dev[dev] = 0
                 self._gc_count_by_dev[dev] = self._gc_count_by_dev.get(dev, 0) + 1
                 self._gc_total_count += 1
@@ -362,8 +471,8 @@ class MemLord:
             _log(
                 f"{YELLOW}[auto_gc]{RESET} {dev}: ran GC "
                 f"(count={per_dev_count}), total across devices={total_count}; "
-                f"trigger={metric_name} {format_bytes(metric_val)} >= {format_bytes(threshold)} "
-                f"(alloc={format_bytes(current_alloc)}, freed={format_bytes(current_freed)})"
+                f"band_used≈{used_pct:.1f}% metric={metric} "
+                f"{format_bytes(value)} >= {format_bytes(threshold_bytes)}"
             )
 
     # ---- Internal helpers used by hooks ----
@@ -380,10 +489,8 @@ class MemLord:
                 affected.add(dev)
                 _log(f"{RED}[allocate]{RESET} +{format_bytes(b)} on {dev} (hook)")
                 self._record_site_locked(kind="alloc", dev=dev, bytes_=b, site=caller)
-        # New: check auto-GC after hook allocations as well
-        if self._auto_gc_bytes is not None and self._auto_gc_bytes > 0:
-            for dev in affected:
-                self._maybe_auto_gc(dev)
+        for dev in affected:
+            self._maybe_auto_gc(dev)
 
     def _apply_sizes_free(self, sizes_by_dev: Dict[torch.device, int]) -> None:
         if not sizes_by_dev:
@@ -399,10 +506,8 @@ class MemLord:
                 affected.add(dev)
                 _log(f"{GREEN}[free]{RESET} released {format_bytes(b)} on {dev} (hook)")
                 self._record_site_locked(kind="free", dev=dev, bytes_=b, site=caller)
-        # Check auto-GC after hook frees
-        if self._auto_gc_bytes is not None and self._auto_gc_bytes > 0:
-            for dev in affected:
-                self._maybe_auto_gc(dev)
+        for dev in affected:
+            self._maybe_auto_gc(dev)
 
     # ---- Hotspot bookkeeping ----
     def _record_site_locked(self, kind: str, dev: torch.device, bytes_: int, site: Optional[str]) -> None:
