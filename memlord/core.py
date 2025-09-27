@@ -16,6 +16,7 @@ from .util import (
     get_device_mem_stats,  # background per-device stats
 )
 from .fire import TorchMoveHooks, run_backend_gc as _run_backend_gc, sum_for_device as _sum_for_device
+from .snake import SnakeHooks  # <-- NEW: Python-level GC hooks
 
 
 # ---------- TYPE ALIASES ----------
@@ -40,14 +41,6 @@ Strategy shape:
         },
         ...
     }
-
-Semantics:
-  • On allocate/free (and hook variants), MemLord:
-      1) Reads device usage (used/total) percent from util’s background cache.
-      2) Selects the FIRST band (lo <= used_pct < hi) in insertion order.
-      3) Resolves threshold bytes from 'bytes' and/or 'percent * total'.
-      4) Computes the metric value ("allocated"|"freed"|"max").
-      5) If metric_value >= threshold → run backend GC (resets freed counter).
 """
 
 
@@ -64,6 +57,7 @@ class MemLord:
       - top_free_site(device?):  -> (device, 'file:line', bytes) | None
       - set_auto_gc_strategy(dict|None): replace strategy. If None, uses a default.
       - hook_into_torch():   install hooks for Tensor/Module move + CUDA sync APIs.
+      - hook_into_python():  install Python GC hooks (del tensor/module) via SnakeHooks.
 
     Colored logs (only if DEBUG=1):
       allocate -> red, free -> green, summaries -> cyan, auto-GC/strategy -> yellow, reset -> magenta
@@ -90,11 +84,23 @@ class MemLord:
         self._auto_gc_strategy: dict = {}
         self.set_auto_gc_strategy(auto_gc_strategy)
 
+        # Python-layer GC hooks (optional, created on demand)
+        self._snake_hooks: Optional[SnakeHooks] = None
+
     # ---------- Public API ----------
     def allocate(self, ob: ObjOrTuple) -> None:
         sizes = self._sizes_for_many(ob)
         caller = best_user_frame()
         affected: set[torch.device] = set()
+
+        # If Python hooks are active, register finalizers for tracked objects
+        if self._snake_hooks is not None:
+            if isinstance(ob, tuple):
+                for x in ob:
+                    if isinstance(x, (nn.Module, torch.Tensor)):
+                        self._snake_hooks.register(x)
+            elif isinstance(ob, (nn.Module, torch.Tensor)):
+                self._snake_hooks.register(ob)
 
         with self._lock:
             for dev, b in sizes.items():
@@ -181,30 +187,13 @@ class MemLord:
             return _top_site_query(device, self._top_free_site)
 
     def set_auto_gc_strategy(self, strategy: Optional[dict]) -> None:
-        """
-        Replace the current auto-GC strategy. If None, install a reasonable default.
-
-        Strategy shape:
-            {
-                (lo_pct:int|float, hi_pct:int|float): {
-                    "metric": "allocated" | "freed" | "max",
-                    "threshold": {
-                        "bytes":   int,
-                        "percent": float,
-                    }
-                },
-                ...
-            }
-        """
         if strategy is None:
-            # Default: thresholds scale with capacity; get stricter as usage climbs.
             strategy = {
                 (0, 50):   {"metric": "max", "threshold": {"percent": 0.50}},
                 (50, 75):  {"metric": "max", "threshold": {"percent": 0.33}},
                 (75, 101): {"metric": "max", "threshold": {"percent": 0.25}},
             }
 
-        # Light validation
         for k, v in strategy.items():
             if not (isinstance(k, tuple) and len(k) == 2 and all(isinstance(x, (int, float)) for x in k)):
                 raise ValueError(f"Strategy key must be (lo_pct, hi_pct), got {k}")
@@ -223,18 +212,23 @@ class MemLord:
         _log(f"{YELLOW}[set_auto_gc_strategy]{RESET} installed {len(strategy)} band(s)")
 
     def hook_into_torch(self) -> "TorchMoveHooks":
-        """
-        Install hooks for:
-          - torch.Tensor.to
-          - nn.Module.to
-          - torch.cuda.synchronize
-          - torch.cuda.Stream.synchronize
-          - torch.cuda.Event.synchronize
-        Returns the hooks object so you can later .disable() it if needed.
-        """
         hooks = TorchMoveHooks(self)
         hooks.enable()
         return hooks
+
+    def hook_into_python(self, *, enable_factory_wrappers: bool = True) -> "SnakeHooks":
+        """
+        Install Python-level GC hooks that capture `del tensor/module` events.
+
+        If enable_factory_wrappers=True, common torch factory functions are wrapped
+        so freshly-created tensors are auto-registered for finalization.
+        """
+        if self._snake_hooks is not None:
+            return self._snake_hooks
+        sh = SnakeHooks(self, enable_factory_wrappers=enable_factory_wrappers)
+        sh.enable()
+        self._snake_hooks = sh
+        return sh
 
     # ---------- Memory accounting helpers ----------
     def _sizes_for_many(self, ob: ObjOrTuple) -> Dict[torch.device, int]:
@@ -345,9 +339,6 @@ class MemLord:
 
     # ---------- Device memory stats (from util pollers) ----------
     def _device_memory_stats(self, dev: torch.device) -> Tuple[Optional[int], Optional[int], float]:
-        """
-        Returns (total_bytes, used_bytes, used_pct) from util's per-device background poller.
-        """
         return get_device_mem_stats(dev)
 
     # ---------- Strategy selection & evaluation ----------
@@ -420,16 +411,11 @@ class MemLord:
             _log(
                 f"{YELLOW}[auto_gc]{RESET} {dev}: ran GC "
                 f"(count={per_dev_count}), total across devices={total_count}; "
-                f"band_used≈{used_pct:.1f}% metric={metric} "
-                f"{format_bytes(value)} >= {format_bytes(threshold_bytes)}"
+                f"metric={metric}"
             )
 
-    # ---- Internal helpers used by hooks (required by TorchMoveHooks) ----
+    # ---- Internal helpers used by TorchMoveHooks ----
     def _apply_sizes_allocate(self, sizes_by_dev: Dict[torch.device, int]) -> None:
-        """
-        Called by TorchMoveHooks when a move creates new allocations on a device.
-        Updates internal counters and evaluates auto-GC.
-        """
         if not sizes_by_dev:
             return
         caller = best_user_frame()
@@ -446,10 +432,6 @@ class MemLord:
             self._maybe_auto_gc(dev)
 
     def _apply_sizes_free(self, sizes_by_dev: Dict[torch.device, int]) -> None:
-        """
-        Called by TorchMoveHooks when a move frees memory on a device.
-        Updates internal counters and evaluates auto-GC.
-        """
         if not sizes_by_dev:
             return
         caller = best_user_frame()
@@ -489,12 +471,6 @@ def _top_site_query(
     device: torch.device | None,
     top_map: Dict[torch.device, Tuple[str, int]],
 ) -> Optional[Tuple[torch.device, str, int]]:
-    """
-    device rules:
-      - None -> best across all devices
-      - device.type only (index None) -> best across all devices of that type
-      - device with index -> that device only (or None if no record)
-    """
     if not top_map:
         return None
 
