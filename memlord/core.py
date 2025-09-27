@@ -1,35 +1,21 @@
-# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
-# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2025 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
-# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
-import os
 import threading
-import traceback
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Tuple, Generator, Optional, List
 
 import torch
 import torch.nn as nn
 
-# ---------- ANSI COLORS ----------
-RESET   = "\033[0m"
-RED     = "\033[91m"
-GREEN   = "\033[92m"
-YELLOW  = "\033[93m"
-CYAN    = "\033[96m"
-MAGENTA = "\033[95m"
+from .util import (
+    RESET, RED, GREEN, YELLOW, CYAN, MAGENTA,
+    is_debug, log as _log, format_bytes, best_user_frame,
+)
+from .fire import TorchMoveHooks, run_backend_gc as _run_backend_gc, sum_for_device as _sum_for_device
 
-# ---------- DEBUG (dynamic) ----------
-def _is_debug() -> bool:
-    # Read env every time so tests can flip DEBUG at runtime
-    return os.environ.get("DEBUG", "0") == "1"
-
-def _log(msg: str) -> None:
-    if _is_debug():
-        print(msg)
 
 # ---------- TYPE ALIASES ----------
 Obj = nn.Module | torch.Tensor
@@ -79,7 +65,7 @@ class MemLord:
     # ---------- Public API ----------
     def allocate(self, ob: ObjOrTuple) -> None:
         sizes = self._sizes_for_many(ob)
-        caller = _best_user_frame()
+        caller = best_user_frame()
         with self._lock:
             for dev, b in sizes.items():
                 self._allocated_by_dev[dev] = self._allocated_by_dev.get(dev, 0) + b
@@ -100,7 +86,7 @@ class MemLord:
 
     def free(self, ob: ObjOrTuple) -> None:
         sizes = self._sizes_for_many(ob)
-        caller = _best_user_frame()
+        caller = best_user_frame()
         affected: set[torch.device] = set()
 
         with self._lock:
@@ -321,7 +307,7 @@ class MemLord:
         type_totals: Dict[str, int],
         type_counts: Dict[str, int],
     ) -> None:
-        if not _is_debug():
+        if not is_debug():
             return
         for dev in all_devices:
             val = per_device_map.get(dev, 0)
@@ -352,7 +338,7 @@ class MemLord:
     def _apply_sizes_allocate(self, sizes_by_dev: Dict[torch.device, int]) -> None:
         if not sizes_by_dev:
             return
-        caller = _best_user_frame()
+        caller = best_user_frame()
         with self._lock:
             for dev, b in sizes_by_dev.items():
                 if b <= 0:
@@ -364,7 +350,7 @@ class MemLord:
     def _apply_sizes_free(self, sizes_by_dev: Dict[torch.device, int]) -> None:
         if not sizes_by_dev:
             return
-        caller = _best_user_frame()
+        caller = best_user_frame()
         with self._lock:
             for dev, b in sizes_by_dev.items():
                 if b <= 0:
@@ -391,70 +377,6 @@ class MemLord:
         current = top.get(dev)
         if current is None or new_total > current[1]:
             top[dev] = (site, new_total)
-
-
-def _run_backend_gc(dev: torch.device) -> bool:
-    try:
-        if dev.type == "cuda":
-            if dev.index is not None:
-                torch.cuda.set_device(dev.index)
-            torch.cuda.empty_cache()
-            return True
-        if dev.type == "xpu" and hasattr(torch, "xpu"):
-            torch.xpu.empty_cache()  # type: ignore[attr-defined]
-            return True
-        if dev.type == "mps" and hasattr(torch, "mps"):
-            torch.mps.empty_cache()  # type: ignore[attr-defined]
-            return True
-        if dev.type == "npu" and hasattr(torch, "npu"):
-            torch.npu.empty_cache()  # type: ignore[attr-defined]
-            return True
-        return False
-    except Exception:
-        return False
-
-
-def _sum_for_device(table: Dict[torch.device, int], query: torch.device) -> int:
-    if query.index is None:
-        return sum(v for d, v in table.items() if d.type == query.type)
-    else:
-        return table.get(torch.device(query.type, query.index), 0)
-
-
-def format_bytes(n: int) -> str:
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    x = float(n)
-    for u in units:
-        if x < 1024 or u == units[-1]:
-            return f"{x:.2f} {u}"
-        x /= 1024.0
-
-
-def _best_user_frame() -> Optional[str]:
-    """
-    Find the most relevant user code frame (filename:lineno) by scanning the stack
-    and skipping frames from torch internals and this module.
-    """
-    try:
-        stack = traceback.extract_stack()
-        this_file = __file__ if "__file__" in globals() else None
-
-        for fr in reversed(stack[:-1]):  # exclude this function's own frame
-            fn = (fr.filename or "") or ""
-            try:
-                if this_file and os.path.samefile(fn, this_file):
-                    continue
-            except Exception:
-                # os.path.samefile can fail if any path is non-existent; ignore
-                pass
-            lowered = fn.lower()
-            if "/torch/" in lowered or "\\torch\\" in lowered:
-                continue
-            # Allow site-packages if the project lives there, but typically user files won't.
-            return f"{fn}:{fr.lineno}"
-    except Exception:
-        return None
-    return None
 
 
 def _top_site_query(
@@ -486,245 +408,3 @@ def _top_site_query(
         return None
     site, val = top_map[d]
     return d, site, val
-
-
-# =========================
-# Torch .to() Hook Manager
-# =========================
-
-@dataclass
-class _PendingFree:
-    src_dev: torch.device
-    bytes_: int
-    event: Optional["torch.cuda.Event"]
-    dst_dev: Optional[torch.device] = None
-
-class TorchMoveHooks:
-    """
-    Monkey-patches:
-      - torch.Tensor.to
-      - nn.Module.to
-      - torch.cuda.synchronize
-      - torch.cuda.Stream.synchronize
-      - torch.cuda.Event.synchronize
-
-    Behavior:
-      - Tensor.to: allocate on destination; free on source if device changed.
-                   For CUDA→CUDA with non_blocking=True, free is deferred via CUDA Event.
-      - Module.to: allocate on destination; free on sources. For CUDA→CUDA with non_blocking=True,
-                   free is deferred via CUDA Event.
-      - Any synchronize: call original, then poll pending frees.
-    """
-    def __init__(self, tracker: MemLord) -> None:
-        self.tracker = tracker
-        self._orig_tensor_to = None
-        self._orig_module_to = None
-        self._orig_cuda_synchronize = None
-        self._orig_stream_synchronize = None
-        self._orig_event_synchronize = None
-        self._enabled = False
-        self._pending: List[_PendingFree] = []
-
-    def _poll_pending(self) -> None:
-        if not self._pending:
-            return
-        still_waiting: List[_PendingFree] = []
-        batch: Dict[torch.device, int] = {}
-        for item in self._pending:
-            ev = item.event
-            if ev is None:
-                batch[item.src_dev] = batch.get(item.src_dev, 0) + item.bytes_
-                continue
-            if ev.query():
-                batch[item.src_dev] = batch.get(item.src_dev, 0) + item.bytes_
-            else:
-                still_waiting.append(item)
-        self._pending = still_waiting
-        if batch:
-            self.tracker._apply_sizes_free(batch)
-
-    def enable(self) -> None:
-        if self._enabled:
-            return
-
-        # Save originals
-        self._orig_tensor_to = torch.Tensor.to
-        self._orig_module_to = nn.Module.to
-        self._orig_cuda_synchronize = getattr(torch.cuda, "synchronize", None)
-
-        StreamCls = getattr(torch.cuda, "Stream", None)
-        EventCls  = getattr(torch.cuda, "Event", None)
-        if StreamCls is not None:
-            self._orig_stream_synchronize = getattr(StreamCls, "synchronize", None)
-        if EventCls is not None:
-            self._orig_event_synchronize = getattr(EventCls, "synchronize", None)
-
-        # Patch Tensor.to
-        def tensor_to_wrapper(t: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-            src_dev = t.device
-            try:
-                sizes_src = self.tracker._sizes_by_device_instance(t)
-            except Exception:
-                sizes_src = {}
-
-            non_blocking = bool(kwargs.get("non_blocking", False))
-            out = self._orig_tensor_to(t, *args, **kwargs)  # type: ignore[misc]
-            dst_dev = out.device
-
-            try:
-                sizes_dst = self.tracker._sizes_by_device_instance(out)
-            except Exception:
-                sizes_dst = {}
-            if sizes_dst:
-                self.tracker._apply_sizes_allocate(sizes_dst)
-
-            added_deferred = False
-            if dst_dev != src_dev and sizes_src:
-                defer = (
-                    non_blocking and
-                    torch.cuda.is_available() and
-                    src_dev.type == "cuda" and
-                    dst_dev.type == "cuda"
-                )
-                if defer:
-                    if dst_dev.index is not None:
-                        torch.cuda.set_device(dst_dev.index)
-                    stream = torch.cuda.current_stream()
-                    ev = torch.cuda.Event(blocking=False, enable_timing=False, interprocess=False)
-                    stream.record_event(ev)
-                    for sdev, b in sizes_src.items():
-                        if b <= 0:
-                            continue
-                        if sdev.type == "cuda":
-                            self._pending.append(_PendingFree(src_dev=sdev, bytes_=b, event=ev, dst_dev=dst_dev))
-                            added_deferred = True
-                        else:
-                            self.tracker._apply_sizes_free({sdev: b})
-                else:
-                    self.tracker._apply_sizes_free(sizes_src)
-
-            # Only poll when we did NOT queue deferred frees (to keep tests' < comparison true)
-            if not added_deferred:
-                self._poll_pending()
-            return out
-
-        # Patch Module.to
-        def module_to_wrapper(m: nn.Module, *args: Any, **kwargs: Any):
-            try:
-                sizes_before = self.tracker._sizes_by_device_instance(m)
-            except Exception:
-                sizes_before = {}
-            non_blocking = bool(kwargs.get("non_blocking", False))
-            ret = self._orig_module_to(m, *args, **kwargs)  # type: ignore[misc]
-            try:
-                sizes_after = self.tracker._sizes_by_device_instance(m)
-            except Exception:
-                sizes_after = {}
-
-            try:
-                if sizes_after:
-                    self.tracker._apply_sizes_allocate(sizes_after)
-            except Exception:
-                pass
-
-            added_deferred = False
-            defer = False
-            if non_blocking:
-                any_cuda_src = any(d.type == "cuda" for d in sizes_before.keys())
-                any_cuda_dst = any(d.type == "cuda" for d in sizes_after.keys())
-                if any_cuda_src and any_cuda_dst and torch.cuda.is_available():
-                    defer = True
-
-            if defer:
-                dst_cuda_devs = [d for d in sizes_after.keys() if d.type == "cuda"]
-                if dst_cuda_devs:
-                    dst = dst_cuda_devs[0]
-                    if dst.index is not None:
-                        torch.cuda.set_device(dst.index)
-                    stream = torch.cuda.current_stream()
-                    ev = torch.cuda.Event(blocking=False, enable_timing=False, interprocess=False)
-                    stream.record_event(ev)
-                    for src_dev, b in sizes_before.items():
-                        if b <= 0:
-                            continue
-                        if src_dev.type == "cuda":
-                            self._pending.append(_PendingFree(src_dev=src_dev, bytes_=b, event=ev, dst_dev=dst))
-                            added_deferred = True
-                        else:
-                            self.tracker._apply_sizes_free({src_dev: b})
-                else:
-                    self.tracker._apply_sizes_free(sizes_before)
-            else:
-                self.tracker._apply_sizes_free(sizes_before)
-
-            if not added_deferred:
-                self._poll_pending()
-            return ret
-
-        # Patch torch.cuda.synchronize (module function)
-        def cuda_synchronize_wrapper(*args: Any, **kwargs: Any):
-            result = self._orig_cuda_synchronize(*args, **kwargs) if self._orig_cuda_synchronize else None
-            self._poll_pending()
-            return result
-
-        # Patch Stream.synchronize (instance method)
-        def stream_synchronize_wrapper(self_stream, *args: Any, **kwargs: Any):
-            res = self._orig_stream_synchronize(self_stream, *args, **kwargs) if self._orig_stream_synchronize else None
-            self._poll_pending()
-            return res
-
-        # Patch Event.synchronize (instance method)
-        def event_synchronize_wrapper(self_event, *args: Any, **kwargs: Any):
-            res = self._orig_event_synchronize(self_event, *args, **kwargs) if self._orig_event_synchronize else None
-            self._poll_pending()
-            return res
-
-        # Install patches
-        torch.Tensor.to = tensor_to_wrapper  # type: ignore[assignment]
-        nn.Module.to = module_to_wrapper     # type: ignore[assignment]
-        if self._orig_cuda_synchronize is not None:
-            torch.cuda.synchronize = cuda_synchronize_wrapper  # type: ignore[assignment]
-        if StreamCls is not None and self._orig_stream_synchronize is not None:
-            StreamCls.synchronize = stream_synchronize_wrapper  # type: ignore[assignment]
-        if EventCls is not None and self._orig_event_synchronize is not None:
-            EventCls.synchronize = event_synchronize_wrapper  # type: ignore[assignment]
-
-        self._enabled = True
-        hooked = ["Tensor.to", "Module.to"]
-        if self._orig_cuda_synchronize is not None:
-            hooked.append("cuda.synchronize")
-        if self._orig_stream_synchronize is not None:
-            hooked.append("Stream.synchronize")
-        if self._orig_event_synchronize is not None:
-            hooked.append("Event.synchronize")
-        _log(f"{YELLOW}[hooks]{RESET} Patched: {', '.join(hooked)}")
-
-    def disable(self) -> None:
-        if not self._enabled:
-            return
-        if self._orig_tensor_to is not None:
-            torch.Tensor.to = self._orig_tensor_to  # type: ignore[assignment]
-        if self._orig_module_to is not None:
-            nn.Module.to = self._orig_module_to     # type: ignore[assignment]
-        if self._orig_cuda_synchronize is not None:
-            torch.cuda.synchronize = self._orig_cuda_synchronize  # type: ignore[assignment]
-
-        StreamCls = getattr(torch.cuda, "Stream", None)
-        EventCls  = getattr(torch.cuda, "Event", None)
-        if StreamCls is not None and self._orig_stream_synchronize is not None:
-            StreamCls.synchronize = self._orig_stream_synchronize  # type: ignore[assignment]
-        if EventCls is not None and self._orig_event_synchronize is not None:
-            EventCls.synchronize = self._orig_event_synchronize  # type: ignore[assignment]
-
-        self._orig_tensor_to = None
-        self._orig_module_to = None
-        self._orig_cuda_synchronize = None
-        self._orig_stream_synchronize = None
-        self._orig_event_synchronize = None
-        self._enabled = False
-        self._poll_pending()
-        _log(f"{YELLOW}[hooks]{RESET} Restored patches")
-
-    def poll(self) -> None:
-        """Manual flush of deferred frees (e.g., if you synchronize via other means)."""
-        self._poll_pending()

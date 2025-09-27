@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
-# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2025 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
@@ -10,8 +10,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-# Import MemLord (renamed package/class)
-from memlord.core import MemLord
+from memlord import MemLord
 
 # ---------- Helpers ----------
 
