@@ -57,25 +57,24 @@ def ensure_debug_off_and_restore_env():
 
 
 # --------------------------------------------
-# Finalizer basics: CPU tensor, explicit alloc
+# Finalizer basics: CPU tensor (auto-hooked)
 # --------------------------------------------
 
 def test_finalizer_tensor_cpu_del_triggers_freed():
     tracker = MemLord(auto_gc_strategy={})  # disable auto-GC resets
-    tracker.hook_into_python(enable_factory_wrappers=False)
+    hooks = tracker.hook_into_python(enable_factory_wrappers=True)
+    try:
+        t = alloc_tensor_on("cpu", (256, 256))
+        expected = tensor_nbytes(t)
 
-    t = alloc_tensor_on("cpu", (256, 256))
-    expected = tensor_nbytes(t)
+        # Drop the only reference and force GC — finalizer should credit freed bytes
+        del t
+        gc.collect()
 
-    # allocate() records bytes and (since python hooks are active) registers finalizer
-    tracker.allocate(t)
-
-    # Drop the only reference and force GC — finalizer should credit freed bytes
-    del t
-    gc.collect()
-
-    freed, _ = tracker.freed(torch.device("cpu"))
-    assert freed >= expected
+        freed, _ = tracker.freed(torch.device("cpu"))
+        assert freed >= expected
+    finally:
+        hooks.disable()
 
 
 # ---------------------------------------------------------
@@ -84,61 +83,61 @@ def test_finalizer_tensor_cpu_del_triggers_freed():
 
 def test_finalizer_tensor_cpu_aliasing_only_last_del_triggers():
     tracker = MemLord(auto_gc_strategy={})
-    tracker.hook_into_python(enable_factory_wrappers=False)
+    hooks = tracker.hook_into_python(enable_factory_wrappers=True)
+    try:
+        t = alloc_tensor_on("cpu", (128, 128))
+        alias = t  # second reference
+        expected = tensor_nbytes(t)
 
-    t = alloc_tensor_on("cpu", (128, 128))
-    alias = t  # second reference
-    expected = tensor_nbytes(t)
+        # Delete only one reference; object still alive via 'alias'
+        del t
+        gc.collect()
 
-    tracker.allocate(t)  # registers finalizer for the underlying object
+        freed_before, _ = tracker.freed(torch.device("cpu"))
+        assert freed_before == 0  # finalizer must NOT have run yet
 
-    # Delete only one reference; object still alive via 'alias'
-    del t
-    gc.collect()
+        # Now delete the last reference; finalizer should fire
+        del alias
+        gc.collect()
 
-    freed_before, _ = tracker.freed(torch.device("cpu"))
-    assert freed_before == 0  # finalizer must NOT have run yet
-
-    # Now delete the last reference; finalizer should fire
-    del alias
-    gc.collect()
-
-    freed_after, _ = tracker.freed(torch.device("cpu"))
-    assert freed_after >= expected
+        freed_after, _ = tracker.freed(torch.device("cpu"))
+        assert freed_after >= expected
+    finally:
+        hooks.disable()
 
 
 # -------------------------------------------------
 # Module finalizer: CPU nn.Module lifetime end free
+# (parameters are created via torch factories -> auto-registered)
 # -------------------------------------------------
 
 def test_finalizer_module_cpu_del_triggers_freed():
     tracker = MemLord(auto_gc_strategy={})
-    tracker.hook_into_python(enable_factory_wrappers=False)
+    hooks = tracker.hook_into_python(enable_factory_wrappers=True)
+    try:
+        # Enable hooks BEFORE creating the module so its parameters get registered
+        m = module_linear(128, 256, device="cpu", dtype=torch.float32)
+        expected = module_nbytes(m)
 
-    m = module_linear(128, 256, device="cpu", dtype=torch.float32)
-    expected = module_nbytes(m)
+        del m
+        gc.collect()
 
-    tracker.allocate(m)
-
-    del m
-    gc.collect()
-
-    freed, _ = tracker.freed(torch.device("cpu"))
-    assert freed >= expected
+        freed, _ = tracker.freed(torch.device("cpu"))
+        assert freed >= expected
+    finally:
+        hooks.disable()
 
 
 # ----------------------------------------------------------
-# Factory wrappers path: auto-register without tracker.allocate
+# Factory wrappers path: auto-register without manual tracking
 # ----------------------------------------------------------
 
 def test_finalizer_factory_wrappers_auto_register_tensor_cpu():
     tracker = MemLord(auto_gc_strategy={})
     hooks = tracker.hook_into_python(enable_factory_wrappers=True)
-
     try:
         t = torch.empty((64, 64), dtype=torch.float32, device="cpu")
         expected = tensor_nbytes(t)
-        # NOTE: We did NOT call tracker.allocate(t); finalizer alone should credit freed.
 
         del t
         gc.collect()
@@ -146,7 +145,6 @@ def test_finalizer_factory_wrappers_auto_register_tensor_cpu():
         freed, _ = tracker.freed(torch.device("cpu"))
         assert freed >= expected
     finally:
-        # restore original torch factories for isolation
         hooks.disable()
 
 
@@ -158,43 +156,43 @@ def test_finalizer_factory_wrappers_auto_register_tensor_cpu():
 def test_finalizer_tensor_cuda_del_triggers_freed():
     cuda_or_skip(1)
     tracker = MemLord(auto_gc_strategy={})
-    tracker.hook_into_python(enable_factory_wrappers=False)
+    hooks = tracker.hook_into_python(enable_factory_wrappers=True)
+    try:
+        d0 = torch.device("cuda:0")
+        t = alloc_tensor_on(d0, (128, 128))
+        expected = tensor_nbytes(t)
 
-    d0 = torch.device("cuda:0")
-    t = alloc_tensor_on(d0, (128, 128))
-    expected = tensor_nbytes(t)
+        del t
+        gc.collect()
 
-    tracker.allocate(t)
-
-    del t
-    gc.collect()
-
-    freed_cuda0, _ = tracker.freed(d0)
-    assert freed_cuda0 >= expected
+        freed_cuda0, _ = tracker.freed(d0)
+        assert freed_cuda0 >= expected
+    finally:
+        hooks.disable()
 
 
 @pytest.mark.cuda
 def test_finalizer_tensor_cuda_aliasing_only_last_del_triggers():
     cuda_or_skip(1)
     tracker = MemLord(auto_gc_strategy={})
-    tracker.hook_into_python(enable_factory_wrappers=False)
+    hooks = tracker.hook_into_python(enable_factory_wrappers=True)
+    try:
+        d0 = torch.device("cuda:0")
+        t = alloc_tensor_on(d0, (64, 64))
+        alias = t
+        expected = tensor_nbytes(t)
 
-    d0 = torch.device("cuda:0")
-    t = alloc_tensor_on(d0, (64, 64))
-    alias = t
-    expected = tensor_nbytes(t)
+        del t
+        gc.collect()
+        freed_before, _ = tracker.freed(d0)
+        assert freed_before == 0  # still referenced by 'alias'
 
-    tracker.allocate(t)
-
-    del t
-    gc.collect()
-    freed_before, _ = tracker.freed(d0)
-    assert freed_before == 0  # still referenced by 'alias'
-
-    del alias
-    gc.collect()
-    freed_after, _ = tracker.freed(d0)
-    assert freed_after >= expected
+        del alias
+        gc.collect()
+        freed_after, _ = tracker.freed(d0)
+        assert freed_after >= expected
+    finally:
+        hooks.disable()
 
 
 @pytest.mark.cuda
@@ -202,12 +200,10 @@ def test_finalizer_factory_wrappers_auto_register_tensor_cuda():
     cuda_or_skip(1)
     tracker = MemLord(auto_gc_strategy={})
     hooks = tracker.hook_into_python(enable_factory_wrappers=True)
-
     try:
         d0 = torch.device("cuda:0")
         t = torch.empty((32, 32), dtype=torch.float32, device=d0)
         expected = tensor_nbytes(t)
-        # Not calling tracker.allocate(t)
 
         del t
         gc.collect()
@@ -224,20 +220,21 @@ def test_finalizer_factory_wrappers_auto_register_tensor_cuda():
 
 def test_finalizer_idempotent_on_multiple_gc_runs_cpu():
     tracker = MemLord(auto_gc_strategy={})
-    tracker.hook_into_python(enable_factory_wrappers=False)
+    hooks = tracker.hook_into_python(enable_factory_wrappers=True)
+    try:
+        t = alloc_tensor_on("cpu", (100, 100))
+        expected = tensor_nbytes(t)
 
-    t = alloc_tensor_on("cpu", (100, 100))
-    expected = tensor_nbytes(t)
-    tracker.allocate(t)
+        del t
+        gc.collect()
+        freed1, _ = tracker.freed(torch.device("cpu"))
 
-    del t
-    gc.collect()
-    freed1, _ = tracker.freed(torch.device("cpu"))
+        # Additional GC passes should not change the freed counter for this object
+        gc.collect()
+        gc.collect()
+        freed2, _ = tracker.freed(torch.device("cpu"))
 
-    # Additional GC passes should not change the freed counter for this object
-    gc.collect()
-    gc.collect()
-    freed2, _ = tracker.freed(torch.device("cpu"))
-
-    assert freed1 >= expected
-    assert freed2 == freed1
+        assert freed1 >= expected
+        assert freed2 == freed1
+    finally:
+        hooks.disable()
