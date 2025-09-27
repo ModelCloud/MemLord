@@ -46,7 +46,6 @@ def best_user_frame() -> Optional[str]:
         for fr in reversed(stack[:-1]):  # exclude this function's own frame
             fn = (fr.filename or "") or ""
             try:
-                # os.path.samefile may fail for non-existent paths; ignore exceptions
                 import os
                 if this_file and os.path.exists(fn) and os.path.exists(this_file):
                     if os.path.samefile(fn, this_file):

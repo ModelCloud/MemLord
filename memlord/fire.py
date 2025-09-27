@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import threading
 
 import torch
@@ -59,6 +59,7 @@ class _PendingFree:
 # thread-local to shuttle module->tensor non_blocking intent
 _TLS = threading.local()
 
+
 class TorchMoveHooks:
     """
     Monkey-patches:
@@ -77,23 +78,25 @@ class TorchMoveHooks:
         self._orig_event_synchronize = None
         self._enabled = False
         self._pending: List[_PendingFree] = []
+        self._pending_lock = threading.Lock()  # <-- thread safety for queue
 
     # ------- pending frees -------
     def _poll_pending(self) -> None:
-        if not self._pending:
-            return
-        still_waiting: List[_PendingFree] = []
-        batch: Dict[torch.device, int] = {}
-        for item in self._pending:
-            ev = item.event
-            if ev is None:
-                batch[item.src_dev] = batch.get(item.src_dev, 0) + item.bytes_
-                continue
-            if ev.query():
-                batch[item.src_dev] = batch.get(item.src_dev, 0) + item.bytes_
-            else:
-                still_waiting.append(item)
-        self._pending = still_waiting
+        with self._pending_lock:
+            if not self._pending:
+                return
+            still_waiting: List[_PendingFree] = []
+            batch: Dict[torch.device, int] = {}
+            for item in self._pending:
+                ev = item.event
+                if ev is None:
+                    batch[item.src_dev] = batch.get(item.src_dev, 0) + item.bytes_
+                    continue
+                if ev.query():
+                    batch[item.src_dev] = batch.get(item.src_dev, 0) + item.bytes_
+                else:
+                    still_waiting.append(item)
+            self._pending = still_waiting
         if batch:
             self.tracker._apply_sizes_free(batch)
 
@@ -152,14 +155,20 @@ class TorchMoveHooks:
                     stream = torch.cuda.current_stream()
                     ev = torch.cuda.Event(blocking=False, enable_timing=False, interprocess=False)
                     stream.record_event(ev)
-                    for sdev, b in sizes_src.items():
-                        if b <= 0:
-                            continue
-                        if sdev.type == "cuda":
-                            self._pending.append(_PendingFree(src_dev=sdev, bytes_=b, event=ev, dst_dev=dst_dev))
-                            added_deferred = True
-                        else:
-                            self.tracker._apply_sizes_free({sdev: b})
+                    with self._pending_lock:
+                        for sdev, b in sizes_src.items():
+                            if b <= 0:
+                                continue
+                            if sdev.type == "cuda":
+                                self._pending.append(_PendingFree(src_dev=sdev, bytes_=b, event=ev, dst_dev=dst_dev))
+                                added_deferred = True
+                            else:
+                                # non-CUDA sources can free immediately
+                                pass
+                    # free non-CUDA sources immediately (outside lock)
+                    non_cuda_batch = {sdev: b for sdev, b in sizes_src.items() if sdev.type != "cuda" and b > 0}
+                    if non_cuda_batch:
+                        self.tracker._apply_sizes_free(non_cuda_batch)
                 else:
                     self.tracker._apply_sizes_free(sizes_src)
 
@@ -244,3 +253,7 @@ class TorchMoveHooks:
         self._enabled = False
         self._poll_pending()
         _log(f"{YELLOW}[hooks]{RESET} Restored patches")
+
+    # Optional: public poll, e.g., after torch.cuda.synchronize()
+    def poll(self) -> None:
+        self._poll_pending()

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 import threading
-from typing import Any, Dict, Iterable, Tuple, Generator, Optional, List
+from typing import Any, Dict, Iterable, Tuple, Generator, Optional
 
 import torch
 import torch.nn as nn
