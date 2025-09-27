@@ -28,7 +28,8 @@ class MemLord:
 
     API:
       - allocate(obj|tuple): track allocations (nn.Module or torch.Tensor).
-      - free(obj|tuple):     track frees; optional auto-GC per device-index when freed bytes exceed threshold.
+      - free(obj|tuple):     track frees; optional auto-GC per device-index when
+                             max(allocated_bytes, freed_bytes) exceeds threshold.
       - allocated(device?):  -> (raw_bytes, human_str).
       - freed(device?):      -> (raw_bytes, human_str).
       - top_alloc_site(device?): -> (device, 'file:line', bytes) | None
@@ -66,9 +67,12 @@ class MemLord:
     def allocate(self, ob: ObjOrTuple) -> None:
         sizes = self._sizes_for_many(ob)
         caller = best_user_frame()
+        affected: set[torch.device] = set()
+
         with self._lock:
             for dev, b in sizes.items():
                 self._allocated_by_dev[dev] = self._allocated_by_dev.get(dev, 0) + b
+                affected.add(dev)
                 _log(f"{RED}[allocate]{RESET} +{format_bytes(b)} on {dev}")
                 self._record_site_locked(kind="alloc", dev=dev, bytes_=b, site=caller)
 
@@ -83,6 +87,11 @@ class MemLord:
             type_totals=type_totals,
             type_counts=type_counts,
         )
+
+        # New: check auto-GC after allocations as well (using max(allocated, freed))
+        if self._auto_gc_bytes is not None and self._auto_gc_bytes > 0:
+            for dev in affected:
+                self._maybe_auto_gc(dev)
 
     def free(self, ob: ObjOrTuple) -> None:
         sizes = self._sizes_for_many(ob)
@@ -318,47 +327,82 @@ class MemLord:
 
     # ---------- Auto-GC (per-device only) ----------
     def _maybe_auto_gc(self, dev: torch.device) -> None:
+        """
+        Trigger GC when max(allocated_bytes, freed_bytes) for this device
+        meets/exceeds the configured threshold.
+        """
         threshold = self._auto_gc_bytes
         if threshold is None or threshold <= 0:
             return
+
         with self._lock:
             current_freed = self._freed_by_dev.get(dev, 0)
-        if current_freed < threshold:
+            current_alloc = self._allocated_by_dev.get(dev, 0)
+
+        # Compare using the larger of the two metrics
+        if current_freed >= current_alloc:
+            metric_name = "freed"
+            metric_val = current_freed
+        else:
+            metric_name = "allocated"
+            metric_val = current_alloc
+
+        if metric_val < threshold:
             return
+
         if _run_backend_gc(dev):
             with self._lock:
+                # Preserve allocated accounting; freed counter reflects bytes since last GC, so reset it.
                 self._freed_by_dev[dev] = 0
                 self._gc_count_by_dev[dev] = self._gc_count_by_dev.get(dev, 0) + 1
                 self._gc_total_count += 1
                 per_dev_count = self._gc_count_by_dev[dev]
                 total_count = self._gc_total_count
-            _log(f"{YELLOW}[auto_gc]{RESET} {dev}: ran GC (count={per_dev_count}), total across devices={total_count}")
+
+            _log(
+                f"{YELLOW}[auto_gc]{RESET} {dev}: ran GC "
+                f"(count={per_dev_count}), total across devices={total_count}; "
+                f"trigger={metric_name} {format_bytes(metric_val)} >= {format_bytes(threshold)} "
+                f"(alloc={format_bytes(current_alloc)}, freed={format_bytes(current_freed)})"
+            )
 
     # ---- Internal helpers used by hooks ----
     def _apply_sizes_allocate(self, sizes_by_dev: Dict[torch.device, int]) -> None:
         if not sizes_by_dev:
             return
         caller = best_user_frame()
+        affected: set[torch.device] = set()
         with self._lock:
             for dev, b in sizes_by_dev.items():
                 if b <= 0:
                     continue
                 self._allocated_by_dev[dev] = self._allocated_by_dev.get(dev, 0) + b
+                affected.add(dev)
                 _log(f"{RED}[allocate]{RESET} +{format_bytes(b)} on {dev} (hook)")
                 self._record_site_locked(kind="alloc", dev=dev, bytes_=b, site=caller)
+        # New: check auto-GC after hook allocations as well
+        if self._auto_gc_bytes is not None and self._auto_gc_bytes > 0:
+            for dev in affected:
+                self._maybe_auto_gc(dev)
 
     def _apply_sizes_free(self, sizes_by_dev: Dict[torch.device, int]) -> None:
         if not sizes_by_dev:
             return
         caller = best_user_frame()
+        affected: set[torch.device] = set()
         with self._lock:
             for dev, b in sizes_by_dev.items():
                 if b <= 0:
                     continue
                 self._allocated_by_dev[dev] = max(0, self._allocated_by_dev.get(dev, 0) - b)
                 self._freed_by_dev[dev] = self._freed_by_dev.get(dev, 0) + b
+                affected.add(dev)
                 _log(f"{GREEN}[free]{RESET} released {format_bytes(b)} on {dev} (hook)")
                 self._record_site_locked(kind="free", dev=dev, bytes_=b, site=caller)
+        # Check auto-GC after hook frees
+        if self._auto_gc_bytes is not None and self._auto_gc_bytes > 0:
+            for dev in affected:
+                self._maybe_auto_gc(dev)
 
     # ---- Hotspot bookkeeping ----
     def _record_site_locked(self, kind: str, dev: torch.device, bytes_: int, site: Optional[str]) -> None:
