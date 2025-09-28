@@ -190,9 +190,9 @@ class MemLord:
     def set_auto_gc_strategy(self, strategy: Optional[dict] = None) -> None:
         if strategy is None:
             strategy = {
-                (0, 50):   {"metric": "max", "threshold": {"percent": 50.0}},
-                (50, 75):  {"metric": "max", "threshold": {"percent": 25.0}},
-                (75, 101): {"metric": "max", "threshold": {"percent": 12.5}},
+                (0, 50):   {"metric": "max", "threshold": {"percent": 15.0}},
+                (50, 75):  {"metric": "max", "threshold": {"percent": 10.0}},
+                (75, 101): {"metric": "max", "threshold": {"percent": 7.0,}},
             }
 
         for k, v in strategy.items():

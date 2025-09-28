@@ -142,7 +142,9 @@ class TorchMoveHooks:
                 sizes_dst = self.tracker._sizes_by_device_instance_fast_tensor(out)
             except Exception:
                 pass
-            if sizes_dst:
+
+            # Only treat as an allocation if the DEVICE changed.
+            if dst_dev != src_dev and sizes_dst:
                 self.tracker._apply_sizes_allocate(sizes_dst)
 
             added_deferred = False

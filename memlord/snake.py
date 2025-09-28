@@ -4,7 +4,6 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 from __future__ import annotations
-import types
 import weakref
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -14,63 +13,47 @@ import torch.nn as nn
 from .util import register_snake_hooks_instance, is_shutting_down
 
 
-# ============== helpers for size snapshot (duplicate core logic safely) ==============
+# ===================== safe size helpers (no storage access) ======================
 
-def _gather_tensors(ob: nn.Module | torch.Tensor) -> Iterable[torch.Tensor]:
+def _sizes_for_tensor_fast(t: torch.Tensor) -> Dict[torch.device, int]:
+    dev = t.device
+    if dev.type == "meta":
+        return {}
+    total = 0
+    # Sum components for sparse layouts safely
+    if t.is_sparse:
+        total += int(t.indices().numel() * t.indices().element_size())
+        total += int(t.values().numel() * t.values().element_size())
+    elif t.layout == torch.sparse_csr:
+        total += int(t.crow_indices().numel() * t.crow_indices().element_size())
+        total += int(t.col_indices().numel() * t.col_indices().element_size())
+        total += int(t.values().numel() * t.values().element_size())
+    elif hasattr(torch, "sparse_csc") and t.layout == torch.sparse_csc:  # type: ignore[attr-defined]
+        total += int(t.ccol_indices().numel() * t.ccol_indices().element_size())
+        total += int(t.row_indices().numel() * t.row_indices().element_size())
+        total += int(t.values().numel() * t.values().element_size())
+    else:
+        total += int(t.numel() * t.element_size())
+    if total <= 0:
+        return {}
+    return {dev: total}
+
+
+def _sizes_for_object_safe(ob: nn.Module | torch.Tensor) -> Dict[torch.device, int]:
+    sizes: Dict[torch.device, int] = {}
     if isinstance(ob, torch.Tensor):
-        yield ob
-        return
-    # nn.Module
+        for d, b in _sizes_for_tensor_fast(ob).items():
+            sizes[d] = sizes.get(d, 0) + b
+        return sizes
+
+    # nn.Module: accumulate over params and buffers
     for p in ob.parameters(recurse=True):
-        yield p.data
-    for b in ob.buffers(recurse=True):
-        yield b
-
-
-def _sum_by_dev_dedup(tensors: Iterable[torch.Tensor]) -> Dict[torch.device, int]:
-    seen_keys: set[Tuple[int, int]] = set()
-    by_dev: Dict[torch.device, int] = {}
-
-    def _accumulate_dense(t: torch.Tensor) -> None:
-        dev = t.device
-        if dev.type == "meta":
-            return
-        try:
-            st = t.untyped_storage()
-            key = (st.data_ptr(), st.nbytes())
-            if key in seen_keys:
-                return
-            seen_keys.add(key)
-            by_dev[dev] = by_dev.get(dev, 0) + int(st.nbytes())
-        except RuntimeError:
-            nbytes = int(t.numel() * t.element_size())
-            key = (t.data_ptr(), nbytes)
-            if key in seen_keys:
-                return
-            seen_keys.add(key)
-            by_dev[dev] = by_dev.get(dev, 0) + nbytes
-
-    for t in tensors:
-        if t.is_sparse:
-            _accumulate_dense(t.indices())
-            _accumulate_dense(t.values())
-        elif t.layout == torch.sparse_csr:
-            _accumulate_dense(t.crow_indices())
-            _accumulate_dense(t.col_indices())
-            _accumulate_dense(t.values())
-        elif hasattr(torch, "sparse_csc") and t.layout == torch.sparse_csc:  # type: ignore[attr-defined]
-            _accumulate_dense(t.ccol_indices())
-            _accumulate_dense(t.row_indices())
-            _accumulate_dense(t.values())
-        else:
-            _accumulate_dense(t)
-
-    return by_dev
-
-
-def _sizes_for_object(ob: nn.Module | torch.Tensor) -> Dict[torch.device, int]:
-    tensors = list(_gather_tensors(ob))
-    return _sum_by_dev_dedup(tensors)
+        for d, b in _sizes_for_tensor_fast(p.data).items():
+            sizes[d] = sizes.get(d, 0) + b
+    for bbuf in ob.buffers(recurse=True):
+        for d, b in _sizes_for_tensor_fast(bbuf).items():
+            sizes[d] = sizes.get(d, 0) + b
+    return sizes
 
 
 # ========================== finalizer callback (no cycles / no GC) ===================
@@ -94,23 +77,42 @@ def _finalize_cb(lord_ref: "weakref.ReferenceType", sizes_by_dev: Dict[torch.dev
 
 class SnakeHooks:
     """
-    Python-level hooks to auto-register finalizers for tensors/modules.
+    Python-level hooks to auto-register finalizers for tensors/modules and
+    attribute allocate/free accounting to creation/destruction events.
 
     Features:
-      - Wrap common torch factory functions (e.g., torch.empty/zeros/ones/full/tensor/rand/randn)
-      - Optional deeper wrapping for additional producers (kept minimal)
-      - Register a weakref.finalize per object with a precomputed size snapshot
+      - Wrap common torch factory functions (broad coverage, see list below)
+      - Minimal deep autowrap for additional producers (clone())
+      - On creation: compute SAFE sizes, bump allocation via MemLord, then register a finalizer
+        with the same sizes to guarantee alloc/free symmetry.
+      - Skips allocation counting when an 'out=' buffer is provided.
       - Avoids atexit participation (fin.atexit = False)
       - Avoids cycles by holding only a weakref to MemLord in finalizers
       - Idempotent enable/disable
+      - Per-instance WeakKeyDictionary ensures no double-registration
 
-    NOTE: We keep a per-instance WeakKeyDictionary to avoid double-registering the same object.
+    NOTE: We intentionally DO NOT call any method that touches untyped_storage() here.
     """
 
+    # Broad factory coverage. Many models rely on these APIs for new allocations.
     _FACTORY_FUNCS = [
+        # core factories
         "empty", "zeros", "ones", "full",
-        "rand", "randn", "tensor",
-        # Extend if desired.
+        "rand", "randn", "tensor", "arange",
+
+        # *_like variants
+        "empty_like", "zeros_like", "ones_like", "full_like",
+        "rand_like", "randn_like",
+
+        # sampling / indexing / sequences
+        "randint", "randperm", "linspace", "logspace", "eye", "tri",
+
+        # strided / low-level alloc
+        "empty_strided", "as_strided",
+
+        # distributions (common init)
+        "normal",
+        # (add more as needed)
     ]
 
     def __init__(self, lord, enable_factory_wrappers: bool = True, enable_deep_autowrap: bool = True) -> None:
@@ -122,7 +124,7 @@ class SnakeHooks:
         # Keep (module, name) -> original callable so we can restore
         self._orig: List[Tuple[object, str, object]] = []
         # Track objects already registered to avoid duplicate finalizers
-        self._seen = weakref.WeakKeyDictionary()  # type: ignore[type-arg]
+        self._seen: "weakref.WeakKeyDictionary[object, bool]" = weakref.WeakKeyDictionary()  # type: ignore[type-arg]
 
     # ----------------------------- public API -----------------------------
 
@@ -132,7 +134,7 @@ class SnakeHooks:
         if self._wrap_factories:
             self._patch_factories()
         if self._deep_autowrap:
-            # Minimal deep autowrap (safe no-ops by default). Extend if needed.
+            # Minimal deep autowrap — clone() returns a new tensor
             self._patch_tensor_methods()
             self._patch_additional()
         self._enabled = True
@@ -150,7 +152,7 @@ class SnakeHooks:
         self._orig.clear()
         self._enabled = False
 
-    # Allow MemLord.allocate(...) to register explicitly
+    # Allow MemLord.allocate(...) to register explicitly (fallback path)
     def register(self, ob: nn.Module | torch.Tensor) -> None:
         if is_shutting_down():
             return
@@ -164,11 +166,16 @@ class SnakeHooks:
         except Exception:
             pass
 
-        sizes = _sizes_for_object(ob)
+        # SAFE sizes, allocate, then register finalizer with the SAME sizes
+        sizes = _sizes_for_object_safe(ob)
         if not sizes:
             return
+
+        lord = self._lord_ref()
+        if lord is not None:
+            lord._apply_sizes_allocate(sizes)
+
         fin = weakref.finalize(ob, _finalize_cb, self._lord_ref, sizes)
-        # Prevent atexit registry participation to avoid interpreter-shutdown races
         try:
             fin.atexit = False  # type: ignore[attr-defined]
         except Exception:
@@ -188,7 +195,7 @@ class SnakeHooks:
             setattr(torch, name, wrapper)
 
     def _patch_tensor_methods(self) -> None:
-        # Example: clone() -> returns a new tensor
+        # Example: clone() -> returns a new tensor on same device
         if hasattr(torch.Tensor, "clone"):
             orig = torch.Tensor.clone
             wrapper = self._wrap_tensor_method(orig)
@@ -196,12 +203,8 @@ class SnakeHooks:
             setattr(torch.Tensor, "clone", wrapper)
 
     def _patch_additional(self) -> None:
-        # Example: torch.arange
-        if hasattr(torch, "arange") and callable(getattr(torch, "arange")):
-            orig = torch.arange
-            wrapper = self._wrap_factory(orig)
-            self._orig.append((torch, "arange", orig))
-            setattr(torch, "arange", wrapper)
+        # Placeholder for additional producers
+        pass
 
     # --------------------------- wrappers --------------------------------
 
@@ -209,35 +212,76 @@ class SnakeHooks:
         lord_ref = self._lord_ref
         seen = self._seen
 
+        def _reg(t: torch.Tensor, pre_sizes: Optional[Dict[torch.device, int]] = None):
+            # Register a finalizer with precomputed sizes to keep symmetry
+            try:
+                if seen.get(t, False):
+                    return
+                seen[t] = True
+            except Exception:
+                pass
+            sizes = pre_sizes if pre_sizes is not None else _sizes_for_object_safe(t)
+            if not sizes:
+                return
+            fin = weakref.finalize(t, _finalize_cb, lord_ref, sizes)
+            try:
+                fin.atexit = False  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        def _maybe_is_out_arg(kwargs: dict) -> bool:
+            # If an explicit out= tensor is provided, the call writes into it (no new alloc).
+            if not isinstance(kwargs, dict):
+                return False
+            out = kwargs.get("out", None)
+            if out is None:
+                return False
+            # torch APIs often accept out as Tensor or (Tensor,) or (Tensor, Tensor)
+            if isinstance(out, torch.Tensor):
+                return True
+            if isinstance(out, (tuple, list)) and any(isinstance(x, torch.Tensor) for x in out):
+                return True
+            return False
+
         def wrapper(*args, **kwargs):
+            # If 'out=' is provided, we skip counting allocation (it's reusing memory),
+            # but we still need to register finalizers for any new tensor(s) returned.
+            has_out = _maybe_is_out_arg(kwargs)
             out = fn(*args, **kwargs)
             if is_shutting_down():
                 return out
 
-            def _reg(t: torch.Tensor):
-                try:
-                    if seen.get(t, False):
-                        return
-                    seen[t] = True
-                except Exception:
-                    pass
-                sizes = _sizes_for_object(t)
-                if not sizes:
-                    return
-                fin = weakref.finalize(t, _finalize_cb, lord_ref, sizes)
-                try:
-                    fin.atexit = False  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+            lord = lord_ref()
 
+            # Handle a single tensor
             if isinstance(out, torch.Tensor):
-                _reg(out)
-            elif isinstance(out, (tuple, list)):
-                for x in out:
-                    if isinstance(x, torch.Tensor):
-                        _reg(x)
+                sizes = _sizes_for_object_safe(out)
+                if sizes and lord is not None and not has_out:
+                    lord._apply_sizes_allocate(sizes)
+                _reg(out, sizes)
+                return out
+
+            # Handle tuple/list of tensors
+            if isinstance(out, (tuple, list)):
+                tensors: List[torch.Tensor] = [x for x in out if isinstance(x, torch.Tensor)]
+                if tensors:
+                    agg: Dict[torch.device, int] = {}
+                    per: List[Tuple[torch.Tensor, Dict[torch.device, int]]] = []
+                    for x in tensors:
+                        sx = _sizes_for_object_safe(x)
+                        per.append((x, sx))
+                        for d, b in sx.items():
+                            agg[d] = agg.get(d, 0) + b
+                    if lord is not None and agg and not has_out:
+                        lord._apply_sizes_allocate(agg)
+                    for x, sx in per:
+                        _reg(x, sx)
+                return out
+
+            # Non-tensor outputs pass through
             return out
 
+        # Metadata preservation
         wrapper.__name__ = getattr(fn, "__name__", "memlord_wrapped_factory")
         wrapper.__doc__ = getattr(fn, "__doc__", "")
         wrapper.__qualname__ = getattr(fn, "__qualname__", wrapper.__name__)
@@ -248,33 +292,52 @@ class SnakeHooks:
         lord_ref = self._lord_ref
         seen = self._seen
 
+        def _reg(t: torch.Tensor, pre_sizes: Optional[Dict[torch.device, int]] = None):
+            try:
+                if seen.get(t, False):
+                    return
+                seen[t] = True
+            except Exception:
+                pass
+            sizes = pre_sizes if pre_sizes is not None else _sizes_for_object_safe(t)
+            if not sizes:
+                return
+            fin = weakref.finalize(t, _finalize_cb, lord_ref, sizes)
+            try:
+                fin.atexit = False  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
         def _method(self, *args, **kwargs):
             out = meth(self, *args, **kwargs)
             if is_shutting_down():
                 return out
 
-            def _reg(t: torch.Tensor):
-                try:
-                    if seen.get(t, False):
-                        return
-                    seen[t] = True
-                except Exception:
-                    pass
-                sizes = _sizes_for_object(t)
-                if not sizes:
-                    return
-                fin = weakref.finalize(t, _finalize_cb, lord_ref, sizes)
-                try:
-                    fin.atexit = False  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-
+            lord = lord_ref()
+            # clone and similar return tensors (or collections)
             if isinstance(out, torch.Tensor):
-                _reg(out)
-            elif isinstance(out, (tuple, list)):
-                for x in out:
-                    if isinstance(x, torch.Tensor):
-                        _reg(x)
+                sizes = _sizes_for_object_safe(out)
+                if sizes and lord is not None:
+                    lord._apply_sizes_allocate(sizes)
+                _reg(out, sizes)
+                return out
+
+            if isinstance(out, (tuple, list)):
+                tensors: List[torch.Tensor] = [x for x in out if isinstance(x, torch.Tensor)]
+                if tensors:
+                    agg: Dict[torch.device, int] = {}
+                    per: List[Tuple[torch.Tensor, Dict[torch.device, int]]] = []
+                    for x in tensors:
+                        sx = _sizes_for_object_safe(x)
+                        per.append((x, sx))
+                        for d, b in sx.items():
+                            agg[d] = agg.get(d, 0) + b
+                    if lord is not None and agg:
+                        lord._apply_sizes_allocate(agg)
+                    for x, sx in per:
+                        _reg(x, sx)
+                return out
+
             return out
 
         _method.__name__ = getattr(meth, "__name__", "memlord_wrapped_tensor_method")
