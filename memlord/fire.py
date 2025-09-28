@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2025 ModelCloud.ai
-# SPDX-FileCopyrightText: 2025 qubitium@modelcloud.ai
+# SPDX-LicenseFileCopyright: 2025 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
@@ -12,8 +12,8 @@ import torch
 import torch.nn as nn
 
 from .util import (
-    debug, info, warn, error,
-    format_bytes, best_user_frame,
+    log as _log,
+    format_bytes,
 )
 
 # ---------- Public helpers ----------
@@ -78,7 +78,7 @@ class TorchMoveHooks:
         self._orig_event_synchronize = None
         self._enabled = False
         self._pending: List[_PendingFree] = []
-        self._pending_lock = threading.Lock()  # <-- thread safety for queue
+        self._pending_lock = threading.Lock()  # thread safety for queue
 
     # ------- pending frees -------
     def _poll_pending(self) -> None:
@@ -120,12 +120,11 @@ class TorchMoveHooks:
         # Patch Tensor.to (does all accounting & deferral)
         def tensor_to_wrapper(t: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
             src_dev = t.device
-            # IMPORTANT: use SAFE sizing (no untyped_storage) in hooks to avoid segfaults
-            sizes_src: Dict[torch.device, int] = {}
             try:
+                # SAFE sizing for source (single tensor fast path)
                 sizes_src = self.tracker._sizes_by_device_instance_fast_tensor(t)
             except Exception:
-                pass
+                sizes_src = {}
 
             # Prefer explicit kwarg; else inherit from module.to via thread-local
             if "non_blocking" in kwargs:
@@ -136,19 +135,26 @@ class TorchMoveHooks:
             out = self._orig_tensor_to(t, *args, **kwargs)  # type: ignore[misc]
             dst_dev = out.device
 
-            # SAFE sizing for destination
-            sizes_dst: Dict[torch.device, int] = {}
+            # SAFE sizing for destination (single tensor fast path)
             try:
                 sizes_dst = self.tracker._sizes_by_device_instance_fast_tensor(out)
             except Exception:
-                pass
+                sizes_dst = {}
 
-            # Only treat as an allocation if the DEVICE changed.
-            if dst_dev != src_dev and sizes_dst:
-                self.tracker._apply_sizes_allocate(sizes_dst)
+            did_device_change = (dst_dev != src_dev)
+            dtype_changed = (getattr(out, "dtype", None) != getattr(t, "dtype", None))
 
+            # Allocation accounting:
+            # - if device changed, always count alloc on destination
+            # - if same device but dtype changed, count alloc on destination (new)
+            if sizes_dst:
+                if did_device_change or dtype_changed:
+                    self.tracker._apply_sizes_allocate(sizes_dst)
+
+            # Source free handling:
+            # - Only when device changes. (Same-device dtype cast keeps source alive.)
             added_deferred = False
-            if dst_dev != src_dev and sizes_src:
+            if did_device_change and sizes_src:
                 defer = (
                     non_blocking and
                     torch.cuda.is_available() and
@@ -232,7 +238,7 @@ class TorchMoveHooks:
             hooked.append("Stream.synchronize")
         if self._orig_event_synchronize is not None:
             hooked.append("Event.synchronize")
-        info(f"[hooks] Patched: {', '.join(hooked)}")
+        _log(f"[hooks] Patched: {', '.join(hooked)}")
 
     def disable(self) -> None:
         if not self._enabled:
@@ -258,7 +264,7 @@ class TorchMoveHooks:
         self._orig_event_synchronize = None
         self._enabled = False
         self._poll_pending()
-        info(f"[hooks] Restored patches")
+        _log("[hooks] Restored patches")
 
     # Optional: public poll, e.g., after torch.cuda.synchronize()
     def poll(self) -> None:

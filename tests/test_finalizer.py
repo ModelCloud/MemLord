@@ -238,3 +238,87 @@ def test_finalizer_idempotent_on_multiple_gc_runs_cpu():
         assert freed2 == freed1
     finally:
         hooks.disable()
+
+
+# SPDX-FileCopyrightText: 2025 ModelCloud.ai
+# SPDX-License-Identifier: Apache-2.0
+
+import gc
+import threading
+import time
+import torch
+
+from memlord import MemLord
+
+def test_finalizer_does_not_trigger_autogc(monkeypatch):
+    import threading
+    import gc
+    import torch
+    from memlord import MemLord
+
+    tr = MemLord(auto_gc_strategy={})
+    tr.hook_into_python()
+
+    # Create tensor in a worker and HOLD a reference until we patch.
+    ready = threading.Event()
+    release = threading.Event()
+    holder = {}
+
+    def worker():
+        t = torch.empty(1024)
+        holder["t"] = t  # keep alive until we say release
+        ready.set()
+        release.wait()
+        # drop last ref -> triggers finalizer
+        holder.pop("t", None)
+        gc.collect()
+
+    th = threading.Thread(target=worker)
+    th.start()
+    assert ready.wait(timeout=2.0)
+
+    # Patch AFTER allocation but BEFORE finalizer can run.
+    calls = {"n": 0}
+    def spy(*a, **k):
+        calls["n"] += 1
+    monkeypatch.setattr(tr, "_maybe_auto_gc", spy)
+
+    # Now let the worker drop the ref; finalizers may run.
+    release.set()
+    th.join(timeout=2.0)
+
+    # Force finalizers to run (a few passes for good measure).
+    for _ in range(5):
+        gc.collect()
+
+    # Finalizers must NOT call auto-GC.
+    assert calls["n"] == 0
+
+
+def test_no_deadlock_with_concurrent_finalizers():
+    tr = MemLord(auto_gc_strategy={})
+    tr.hook_into_python()
+
+    stop = threading.Event()
+    exc = []
+
+    def worker():
+        try:
+            while not stop.is_set():
+                x = torch.empty(4096)
+                y = torch.empty(8192)
+                del x, y
+                gc.collect()
+        except Exception as e:
+            exc.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for th in threads:
+        th.start()
+
+    time.sleep(0.5)
+    stop.set()
+    for th in threads:
+        th.join(timeout=2.0)
+
+    assert not exc  # no exceptions or deadlocks observed

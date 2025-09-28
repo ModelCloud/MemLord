@@ -107,12 +107,11 @@ class SnakeHooks:
         # sampling / indexing / sequences
         "randint", "randperm", "linspace", "logspace", "eye", "tri",
 
-        # strided / low-level alloc
-        "empty_strided", "as_strided",
+        # strided / low-level alloc (keep only real alloc)
+        "empty_strided",
 
         # distributions (common init)
         "normal",
-        # (add more as needed)
     ]
 
     def __init__(self, lord, enable_factory_wrappers: bool = True, enable_deep_autowrap: bool = True) -> None:
