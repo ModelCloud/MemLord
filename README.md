@@ -37,21 +37,21 @@ import torch.nn as nn
 from memlord import MemLord
 
 # Create tracker (no auto-GC by default here for determinism)
-lord = MemLord(auto_gc_strategy={})
+mem = MemLord(auto_gc_strategy={})
 
 # (Optional) Hook into Torch moves (Tensor.to / Module.to / CUDA sync)
-torch_hooks = lord.hook_into_torch()
+torch_hooks = mem.hook_into_torch()
 
 # (Optional) Hook Python GC: register finalizers on new tensors/modules
 # Deep autowrap wraps many torch factories + tensor methods
-py_hooks = lord.hook_into_python(
+py_hooks = mem.hook_into_python(
     enable_factory_wrappers=True,
     enable_deep_autowrap=True,
 )
 
 # Track explicit objects (you can still call allocate/free manually if you want)
 x = torch.empty((1024, 1024), device="cuda:0")
-lord.allocate(x)
+mem.allocate(x)
 
 # Move: counted via Torch hooks
 y = x.to("cuda:1", non_blocking=True)
@@ -61,18 +61,18 @@ torch.cuda.synchronize()
 del x, y
 
 # Or explicitly free (if you're not relying on finalizers)
-# lord.free((x, y))
+# mem.free((x, y))
 
 # Query totals
-print(lord.allocated())                           # all devices
-print(lord.allocated(torch.device("cuda")))       # all cuda:* combined
-print(lord.allocated(torch.device("cuda", 1)))    # only cuda:1
+print(mem.allocated())                           # all devices
+print(mem.allocated(torch.device("cuda")))       # all cuda:* combined
+print(mem.allocated(torch.device("cuda", 1)))    # only cuda:1
 
 # Optional: enable call-site tracking then query hotspots
-lord.set_callsite_tracking(True)
+mem.set_callsite_tracking(True)
 # ... do some work that allocates/frees ...
-print(lord.top_alloc_site())                      # (device, "file:line", bytes)
-print(lord.top_free_site(torch.device("cuda")))   # best among all cuda:* devices
+print(mem.top_alloc_site())                      # (device, "file:line", bytes)
+print(mem.top_free_site(torch.device("cuda")))   # best among all cuda:* devices
 
 # Cleanup
 torch_hooks.disable()
@@ -109,7 +109,7 @@ strategy = {
     (50, 75):  {"metric": "max",   "threshold": {"percent": 33.0}},  # 50 <= used% < 75
     (75, 101): {"metric": "freed", "threshold": {"percent": 10.0}},  # 75 <= used% < 101
 }
-lord = MemLord(auto_gc_strategy=strategy)
+mem = MemLord(auto_gc_strategy=strategy)
 
 ```
 
@@ -117,7 +117,7 @@ Trigger semantics:
 
 MemLord polls total/used bytes via device-smi (CPU & CUDA), derives used %, selects the matching band, resolves threshold to bytes (combining bytes/percent as max), then compares the chosen metric value to that threshold. If exceeded, it calls the backend GC for that device and resets the per-device freed counter.
 
-🧪 For deterministic tests, you can monkeypatch MemLord._device_memory_stats or pass {} to disable auto-GC (no bands matched).
+🧪 For deterministic tests, you can monkeypatch Memmem._device_memory_stats or pass {} to disable auto-GC (no bands matched).
 
 Per-device percent threshold of min vram size / 3 or ~33%:
 
@@ -125,7 +125,7 @@ Per-device percent threshold of min vram size / 3 or ~33%:
 strategy = {
     (0, 101): {"metric": "max", "threshold": {"percent": 33.0}}
 }
-lord.set_auto_gc_strategy(legacy_like)
+mem.set_auto_gc_strategy(legacy_like)
 
 ```
 # Python GC Hooks (Finalizers)
@@ -135,7 +135,7 @@ MemLord can auto-credit frees when the last reference to a tensor/module is gone
 Enable once:
 
 ```py
-lord.hook_into_python(
+mem.hook_into_python(
   enable_factory_wrappers=True,   # wrap common torch factories
   enable_deep_autowrap=True,      # also wrap many tensor methods + torch.* funcs
 )
@@ -156,7 +156,7 @@ Aliasing safe: the finalizer only fires when the last reference is gone, so a = 
 
 ```pyc
 
-hooks = lord.hook_into_torch()
+hooks = mem.hook_into_torch()
 # Tracks:
 #   - torch.Tensor.to(...)
 #   - nn.Module.to(...)
@@ -171,7 +171,7 @@ hooks.disable()
 Stack-walking is expensive; disabled by default. Enable only when you need it:
 
 ```py
-lord.set_callsite_tracking(True)
+mem.set_callsite_tracking(True)
 # OR: MemLord(..., track_callsite=True)
 
 ```
@@ -179,8 +179,8 @@ lord.set_callsite_tracking(True)
 Then:
 
 ```pycon
-lord.top_alloc_site()                 # (device, "file:line", cumulative bytes)
-lord.top_free_site(torch.device("cuda"))
+mem.top_alloc_site()                 # (device, "file:line", cumulative bytes)
+mem.top_free_site(torch.device("cuda"))
 
 ```
 
@@ -251,8 +251,8 @@ Clear all counters & hotspot tables (does not change strategies or hooks).
 A. Pure finalizers (no manual free/allocate)
 
 ```py
-lord = MemLord(auto_gc_strategy={})
-lord.hook_into_python(enable_factory_wrappers=True, enable_deep_autowrap=True)
+mem = MemLord(auto_gc_strategy={})
+mem.hook_into_python(enable_factory_wrappers=True, enable_deep_autowrap=True)
 
 t = torch.zeros((1_000, 1_000), device="cuda:0")
 del t
@@ -264,11 +264,11 @@ Finalizer credits 'freed' after GC; optionally gc.collect() in tests
 B. Manual accounting (no Python wrappers)
 
 ```py
-lord = MemLord(auto_gc_strategy={})
+mem = MemLord(auto_gc_strategy={})
 x = torch.empty((10_000, 10_000), device="cpu")
-lord.allocate(x)
+mem.allocate(x)
 # ...
-lord.free(x)
+mem.free(x)
 ```
 
 C. Strategy tuned for pressure
@@ -279,7 +279,7 @@ strategy = {
     (60, 85):  {"metric": "max",   "threshold": {"percent": 25}},
     (85, 101): {"metric": "freed", "threshold": {"bytes": 256 * 1024**2}},  # 256 MiB
 }
-lord = MemLord(auto_gc_strategy=strategy)
+mem = MemLord(auto_gc_strategy=strategy)
 ```
 
 # Logging
