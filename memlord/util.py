@@ -7,37 +7,40 @@ from __future__ import annotations
 import atexit
 import os
 import threading
-import time
 import traceback
 import weakref
 from typing import Dict, Optional, Tuple
 
 import torch
 from device_smi import Device  # hard dependency as requested
+from logbar import LogBar
 
-# ---------- ANSI COLORS ----------
-RESET   = "\033[0m"
-RED     = "\033[91m"
-GREEN   = "\033[92m"
-YELLOW  = "\033[93m"
-CYAN    = "\033[96m"
-MAGENTA = "\033[95m"
+# ---------- Logger ----------
+logger = LogBar("MemLord")
 
-# ---------- DEBUG (dynamic) ----------
 def is_debug() -> bool:
     return os.environ.get("DEBUG", "0") == "1"
 
 def _prefix(msg: str) -> str:
     return f"MemLord: {msg}"
 
-def log(msg: str) -> None:
-    """Debug logging (respects DEBUG env). Always prefixes with 'MemLord: '."""
+def debug(msg: str) -> None:
+    """Debug log, only if DEBUG=1."""
     if is_debug():
-        print(_prefix(msg))
+        logger.debug(_prefix(msg))
 
-def log_always(msg: str) -> None:
-    """Unconditional logging (ignores DEBUG). Always prefixes with 'MemLord: '."""
-    print(_prefix(msg))
+def info(msg: str) -> None:
+    logger.info(_prefix(msg))
+
+def warn(msg: str) -> None:
+    logger.warn(_prefix(msg))
+
+def error(msg: str) -> None:
+    logger.error(_prefix(msg))
+
+# Back-compat aliases
+log = debug
+log_always = info
 
 # ---------- Formatters ----------
 def format_bytes(n: int) -> str:
@@ -60,12 +63,12 @@ def best_user_frame() -> Optional[str]:
 
         for fr in reversed(stack[:-1]):  # exclude this function's own frame
             fn = (fr.filename or "") or ""
-            try:
-                if this_file and os.path.exists(fn) and os.path.exists(this_file):
+            if this_file and os.path.exists(fn) and os.path.exists(this_file):
+                try:
                     if os.path.samefile(fn, this_file):
                         continue
-            except Exception:
-                pass
+                except Exception:
+                    pass
             lowered = fn.lower()
             if "/torch/" in lowered or "\\torch\\" in lowered:
                 continue

@@ -11,10 +11,7 @@ import threading
 import torch
 import torch.nn as nn
 
-from .util import (
-    RESET, RED, GREEN, YELLOW,
-    log as _log, format_bytes, best_user_frame,
-)
+from .util import debug, info, warn, error, format_bytes
 
 # ---------- Public helpers ----------
 
@@ -228,7 +225,7 @@ class TorchMoveHooks:
             hooked.append("Stream.synchronize")
         if self._orig_event_synchronize is not None:
             hooked.append("Event.synchronize")
-        _log(f"{YELLOW}[hooks]{RESET} Patched: {', '.join(hooked)}")
+        info(f"[hooks] Patched: {', '.join(hooked)}")
 
     def disable(self) -> None:
         if not self._enabled:
@@ -254,7 +251,7 @@ class TorchMoveHooks:
         self._orig_event_synchronize = None
         self._enabled = False
         self._poll_pending()
-        _log(f"{YELLOW}[hooks]{RESET} Restored patches")
+        info("[hooks] Restored patches")
 
     # Optional: public poll, e.g., after torch.cuda.synchronize()
     def poll(self) -> None:

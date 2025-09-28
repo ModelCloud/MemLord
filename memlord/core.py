@@ -11,8 +11,7 @@ import torch
 import torch.nn as nn
 
 from .util import (
-    RESET, RED, GREEN, YELLOW, CYAN, MAGENTA,
-    is_debug, log as _log, log_always as _log_always, format_bytes, best_user_frame,
+    is_debug, debug, info, warn, error, format_bytes, best_user_frame,
     get_device_mem_stats,  # device-smi based pollers
 )
 from .fire import TorchMoveHooks, run_backend_gc as _run_backend_gc, sum_for_device as _sum_for_device
@@ -49,9 +48,10 @@ class MemLord:
     Tracks memory per device instance (torch.device) with an auto-GC strategy,
     Torch move hooks, and optional Python GC hooks.
 
-    Colored logs (only if DEBUG=1):
-      allocate -> red, free -> green, summaries -> cyan, auto-GC/strategy -> yellow, reset -> magenta
-      Hook-originated updates are suffixed with "(hook)".
+    Debug-only logs (DEBUG=1):
+      - allocate/free events, summaries
+    Always-on logs:
+      - auto-GC event summaries
     """
 
     def __init__(self, auto_gc_strategy: Optional[dict] = None, *, track_callsite: bool = False) -> None:
@@ -104,7 +104,7 @@ class MemLord:
             for dev, b in sizes.items():
                 self._allocated_by_dev[dev] = self._allocated_by_dev.get(dev, 0) + b
                 affected.add(dev)
-                _log(f"{RED}[allocate]{RESET} +{format_bytes(b)} on {dev}")
+                debug(f"[allocate] +{format_bytes(b)} on {dev}")
                 self._record_site_locked(kind="alloc", dev=dev, bytes_=b, site=caller)
 
             all_devs = self._all_known_devices_locked()
@@ -112,7 +112,7 @@ class MemLord:
             type_counts = self._counts_by_type_locked()
 
         self._print_full_device_summary(
-            header=f"{CYAN}[allocate-summary]{RESET}",
+            header="[allocate-summary]",
             per_device_map=self._allocated_by_dev,
             all_devices=all_devs,
             type_totals=type_totals,
@@ -134,7 +134,7 @@ class MemLord:
                 self._allocated_by_dev[dev] = max(0, self._allocated_by_dev.get(dev, 0) - b)
                 self._freed_by_dev[dev] = self._freed_by_dev.get(dev, 0) + b
                 affected.add(dev)
-                _log(f"{GREEN}[free]{RESET} released {format_bytes(b)} on {dev}")
+                debug(f"[free] released {format_bytes(b)} on {dev}")
                 self._record_site_locked(kind="free", dev=dev, bytes_=b, site=caller)
 
             all_devs = self._all_known_devices_locked()
@@ -142,7 +142,7 @@ class MemLord:
             type_counts = self._counts_by_type_locked()
 
         self._print_full_device_summary(
-            header=f"{CYAN}[free-summary]{RESET}",
+            header="[free-summary]",
             per_device_map=self._freed_by_dev,
             all_devices=all_devs,
             type_totals=freed_type_totals,
@@ -162,18 +162,18 @@ class MemLord:
             self._free_site_bytes.clear()
             self._top_alloc_site.clear()
             self._top_free_site.clear()
-        _log(f"{MAGENTA}[reset]{RESET} counters cleared")
+        debug("[reset] counters cleared")
 
     def allocated(self, device: torch.device | None = None) -> Tuple[int, str]:
         with self._lock:
             val = sum(self._allocated_by_dev.values()) if device is None else _sum_for_device(self._allocated_by_dev, device)
-        _log(f"{CYAN}[allocated]{RESET} query={device}, result={format_bytes(val)}")
+        debug(f"[allocated] query={device}, result={format_bytes(val)}")
         return val, format_bytes(val)
 
     def freed(self, device: torch.device | None = None) -> Tuple[int, str]:
         with self._lock:
             val = sum(self._freed_by_dev.values()) if device is None else _sum_for_device(self._freed_by_dev, device)
-        _log(f"{CYAN}[freed]{RESET} query={device}, result={format_bytes(val)}")
+        debug(f"[freed] query={device}, result={format_bytes(val)}")
         return val, format_bytes(val)
 
     def top_alloc_site(self, device: torch.device | None = None) -> Optional[Tuple[torch.device, str, int]]:
@@ -184,7 +184,7 @@ class MemLord:
         with self._lock:
             return _top_site_query(device, self._top_free_site)
 
-    def set_auto_gc_strategy(self, strategy: Optional[dict]) -> None:
+    def set_auto_gc_strategy(self, strategy: Optional[dict] = None) -> None:
         if strategy is None:
             strategy = {
                 (0, 50):   {"metric": "max", "threshold": {"percent": 25.0}},
@@ -207,7 +207,7 @@ class MemLord:
         with self._lock:
             self._auto_gc_strategy = dict(strategy)
 
-        _log(f"{YELLOW}[set_auto_gc_strategy]{RESET} installed {len(strategy)} band(s)")
+        debug(f"[set_auto_gc_strategy] installed {len(strategy)} band(s)")
 
     def hook_into_torch(self) -> "TorchMoveHooks":
         hooks = TorchMoveHooks(self)
@@ -237,10 +237,7 @@ class MemLord:
         Dedup is not attempted; we count by tensor nbytes only.
         """
         agg: Dict[torch.device, int] = {}
-        if isinstance(ob, tuple):
-            it = ob
-        else:
-            it = (ob,)
+        it = ob if isinstance(ob, tuple) else (ob,)
         for x in it:
             if isinstance(x, torch.Tensor):
                 for dev, b in self._sizes_by_device_instance_fast_tensor(x).items():
@@ -312,7 +309,6 @@ class MemLord:
             dev = t.device
             if dev.type == "meta":
                 return
-            # NOTE: storage path can segfault in some edge cases; only used in explicit allocate()/free()
             try:
                 st = t.untyped_storage()
                 key = (st.data_ptr(), st.nbytes())
@@ -321,7 +317,6 @@ class MemLord:
                 seen_keys.add(key)
                 by_dev[dev] = by_dev.get(dev, 0) + int(st.nbytes())
             except Exception:
-                # Fallback: safe size
                 nbytes = int(t.numel() * t.element_size())
                 key = (t.data_ptr(), nbytes)
                 if key in seen_keys:
@@ -375,10 +370,10 @@ class MemLord:
             return
         for dev in all_devices:
             val = per_device_map.get(dev, 0)
-            _log(f"{header} {dev}: {format_bytes(val)}")
+            debug(f"{header} {dev}: {format_bytes(val)}")
         for dtype in sorted(type_totals.keys()):
             if type_counts.get(dtype, 0) > 1:
-                _log(f"{header} {dtype}: {format_bytes(type_totals[dtype])}")
+                debug(f"{header} {dtype}: {format_bytes(type_totals[dtype])}")
 
     # ---------- Device memory stats ----------
     def _device_memory_stats(self, dev: torch.device) -> Tuple[Optional[int], Optional[int], float]:
@@ -472,7 +467,7 @@ class MemLord:
             # Build a point-in-time summary across all known devices
             lines = []
             lines.append(
-                f"{YELLOW}[auto_gc]{RESET} {dev}: ran GC "
+                f"[auto_gc] {dev}: ran GC "
                 f"(dev_gc_runs={per_dev_count}, global_gc_runs={total_count}); "
                 f"band={band_lo:.0f}–{band_hi:.0f}% used≈{used_pct:.1f}%; "
                 f"metric={metric} value={format_bytes(value)} threshold={format_bytes(threshold_bytes)}"
@@ -492,7 +487,7 @@ class MemLord:
                 )
 
             # Always emit the auto-GC event (ignores DEBUG flag)
-            _log_always("\n".join(lines))
+            info("\n".join(lines))
 
     # ---------- Finalizer-safe free path ----------
     def _apply_sizes_free_finalizer(self, sizes_by_dev: Dict[torch.device, int]) -> None:
@@ -517,7 +512,7 @@ class MemLord:
                     continue
                 self._allocated_by_dev[dev] = self._allocated_by_dev.get(dev, 0) + b
                 affected.add(dev)
-                _log(f"{RED}[allocate]{RESET} +{format_bytes(b)} on {dev} (hook)")
+                debug(f"[allocate] +{format_bytes(b)} on {dev} (hook)")
                 self._record_site_locked(kind="alloc", dev=dev, bytes_=b, site=caller)
         for dev in affected:
             self._maybe_auto_gc(dev)
@@ -534,7 +529,7 @@ class MemLord:
                 self._allocated_by_dev[dev] = max(0, self._allocated_by_dev.get(dev, 0) - b)
                 self._freed_by_dev[dev] = self._freed_by_dev.get(dev, 0) + b
                 affected.add(dev)
-                _log(f"{GREEN}[free]{RESET} released {format_bytes(b)} on {dev} (hook)")
+                debug(f"[free] released {format_bytes(b)} on {dev} (hook)")
                 self._record_site_locked(kind="free", dev=dev, bytes_=b, site=caller)
         for dev in affected:
             self._maybe_auto_gc(dev)
