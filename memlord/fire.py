@@ -11,7 +11,10 @@ import threading
 import torch
 import torch.nn as nn
 
-from .util import debug, info, warn, error, format_bytes
+from .util import (
+    debug, info, warn, error,
+    format_bytes, best_user_frame,
+)
 
 # ---------- Public helpers ----------
 
@@ -117,10 +120,12 @@ class TorchMoveHooks:
         # Patch Tensor.to (does all accounting & deferral)
         def tensor_to_wrapper(t: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
             src_dev = t.device
+            # IMPORTANT: use SAFE sizing (no untyped_storage) in hooks to avoid segfaults
+            sizes_src: Dict[torch.device, int] = {}
             try:
-                sizes_src = self.tracker._sizes_by_device_instance(t)
+                sizes_src = self.tracker._sizes_by_device_instance_fast_tensor(t)
             except Exception:
-                sizes_src = {}
+                pass
 
             # Prefer explicit kwarg; else inherit from module.to via thread-local
             if "non_blocking" in kwargs:
@@ -131,10 +136,12 @@ class TorchMoveHooks:
             out = self._orig_tensor_to(t, *args, **kwargs)  # type: ignore[misc]
             dst_dev = out.device
 
+            # SAFE sizing for destination
+            sizes_dst: Dict[torch.device, int] = {}
             try:
-                sizes_dst = self.tracker._sizes_by_device_instance(out)
+                sizes_dst = self.tracker._sizes_by_device_instance_fast_tensor(out)
             except Exception:
-                sizes_dst = {}
+                pass
             if sizes_dst:
                 self.tracker._apply_sizes_allocate(sizes_dst)
 
@@ -210,8 +217,6 @@ class TorchMoveHooks:
         nn.Module.to = module_to_wrapper     # type: ignore[assignment]
         if self._orig_cuda_synchronize is not None:
             torch.cuda.synchronize = cuda_synchronize_wrapper  # type: ignore[assignment]
-        StreamCls = getattr(torch.cuda, "Stream", None)
-        EventCls  = getattr(torch.cuda, "Event", None)
         if StreamCls is not None and self._orig_stream_synchronize is not None:
             StreamCls.synchronize = stream_synchronize_wrapper  # type: ignore[assignment]
         if EventCls is not None and self._orig_event_synchronize is not None:
@@ -251,7 +256,7 @@ class TorchMoveHooks:
         self._orig_event_synchronize = None
         self._enabled = False
         self._poll_pending()
-        info("[hooks] Restored patches")
+        info(f"[hooks] Restored patches")
 
     # Optional: public poll, e.g., after torch.cuda.synchronize()
     def poll(self) -> None:

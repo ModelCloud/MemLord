@@ -44,11 +44,23 @@ log_always = info
 
 # ---------- Formatters ----------
 def format_bytes(n: int) -> str:
+    """
+    Human-readable bytes with trimmed decimals:
+      1.00 GiB -> '1 GiB'
+      1.10 GiB -> '1.1 GiB'
+      1.11 GiB -> '1.11 GiB'
+    """
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
     x = float(n)
     for u in units:
         if x < 1024 or u == units[-1]:
-            return f"{x:.2f} {u}"
+            s = f"{x:.2f}"
+            # strip trailing zeros and dot if not needed
+            if s.endswith(".00"):
+                s = s[:-3]
+            else:
+                s = s.rstrip("0").rstrip(".")
+            return f"{s} {u}"
         x /= 1024.0
 
 # ---------- Stack helpers ----------

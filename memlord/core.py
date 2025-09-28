@@ -68,7 +68,8 @@ class MemLord:
         self._top_alloc_site: Dict[torch.device, Tuple[str, int]] = {}
         self._top_free_site: Dict[torch.device, Tuple[str, int]] = {}
 
-        self._lock = threading.Lock()
+        # Re-entrant lock to avoid deadlocks from nested acquire
+        self._lock = threading.RLock()
 
         # Auto-GC strategy
         self._auto_gc_strategy: dict = {}
@@ -103,8 +104,9 @@ class MemLord:
         with self._lock:
             for dev, b in sizes.items():
                 self._allocated_by_dev[dev] = self._allocated_by_dev.get(dev, 0) + b
+                total_now = self._allocated_by_dev[dev]
                 affected.add(dev)
-                debug(f"[allocate] +{format_bytes(b)} on {dev}")
+                debug(f"[allocate] +{format_bytes(b)} on {dev}, now {format_bytes(total_now)}")
                 self._record_site_locked(kind="alloc", dev=dev, bytes_=b, site=caller)
 
             all_devs = self._all_known_devices_locked()
@@ -132,9 +134,10 @@ class MemLord:
                 if b <= 0:
                     continue
                 self._allocated_by_dev[dev] = max(0, self._allocated_by_dev.get(dev, 0) - b)
+                total_now = self._allocated_by_dev[dev]
                 self._freed_by_dev[dev] = self._freed_by_dev.get(dev, 0) + b
                 affected.add(dev)
-                debug(f"[free] released {format_bytes(b)} on {dev}")
+                debug(f"[free] -{format_bytes(b)} on {dev}, now {format_bytes(total_now)}")
                 self._record_site_locked(kind="free", dev=dev, bytes_=b, site=caller)
 
             all_devs = self._all_known_devices_locked()
@@ -187,9 +190,9 @@ class MemLord:
     def set_auto_gc_strategy(self, strategy: Optional[dict] = None) -> None:
         if strategy is None:
             strategy = {
-                (0, 50):   {"metric": "max", "threshold": {"percent": 25.0}},
-                (50, 75):  {"metric": "max", "threshold": {"percent": 15.0}},
-                (75, 101): {"metric": "max", "threshold": {"percent": 7.5}},
+                (0, 50):   {"metric": "max", "threshold": {"percent": 50.0}},
+                (50, 75):  {"metric": "max", "threshold": {"percent": 25.0}},
+                (75, 101): {"metric": "max", "threshold": {"percent": 12.5}},
             }
 
         for k, v in strategy.items():
@@ -309,6 +312,7 @@ class MemLord:
             dev = t.device
             if dev.type == "meta":
                 return
+            # NOTE: storage path can segfault in some edge cases; only used in explicit allocate()/free()
             try:
                 st = t.untyped_storage()
                 key = (st.data_ptr(), st.nbytes())
@@ -317,6 +321,7 @@ class MemLord:
                 seen_keys.add(key)
                 by_dev[dev] = by_dev.get(dev, 0) + int(st.nbytes())
             except Exception:
+                # Fallback: safe size
                 nbytes = int(t.numel() * t.element_size())
                 key = (t.data_ptr(), nbytes)
                 if key in seen_keys:
@@ -378,6 +383,21 @@ class MemLord:
     # ---------- Device memory stats ----------
     def _device_memory_stats(self, dev: torch.device) -> Tuple[Optional[int], Optional[int], float]:
         return get_device_mem_stats(dev)
+
+    # ---------- Family-wide counter reset ----------
+    def _reset_counters_family_locked(self, dev_type: str) -> None:
+        """Caller must hold self._lock."""
+        for d in list(self._allocated_by_dev.keys()):
+            if d.type == dev_type:
+                self._allocated_by_dev[d] = 0
+        for d in list(self._freed_by_dev.keys()):
+            if d.type == dev_type:
+                self._freed_by_dev[d] = 0
+
+    def _reset_counters_family(self, dev_type: str) -> None:
+        """Public wrapper that acquires the lock."""
+        with self._lock:
+            self._reset_counters_family_locked(dev_type)
 
     # ---------- Strategy selection & evaluation ----------
     def _select_rule_for_used_pct(self, used_pct: float) -> Optional[tuple[tuple[float, float], dict]]:
@@ -456,9 +476,10 @@ class MemLord:
                 snap_gc_counts = dict(self._gc_count_by_dev)
                 all_devs = self._all_known_devices_locked()
 
-                # Update counters post-GC
-                self._allocated_by_dev[dev] = 0
-                self._freed_by_dev[dev] = 0
+                # Reset allocated/freed for the entire backend family (cuda/xpu/mps/npu)
+                self._reset_counters_family_locked(dev.type)
+
+                # Bump GC counters for triggering device + global
                 self._gc_count_by_dev[dev] = self._gc_count_by_dev.get(dev, 0) + 1
                 per_dev_count = self._gc_count_by_dev[dev]
                 self._gc_total_count += 1
@@ -470,7 +491,8 @@ class MemLord:
                 f"[auto_gc] {dev}: ran GC "
                 f"(dev_gc_runs={per_dev_count}, global_gc_runs={total_count}); "
                 f"band={band_lo:.0f}–{band_hi:.0f}% used≈{used_pct:.1f}%; "
-                f"metric={metric} value={format_bytes(value)} threshold={format_bytes(threshold_bytes)}"
+                f"metric={metric} value={format_bytes(value)} threshold={format_bytes(threshold_bytes)}; "
+                f"counters_reset_family={dev.type}"
             )
 
             # Per-device snapshot lines (allocated/freed from snapshot + live device-smi stats)
@@ -511,8 +533,9 @@ class MemLord:
                 if b <= 0:
                     continue
                 self._allocated_by_dev[dev] = self._allocated_by_dev.get(dev, 0) + b
+                total_now = self._allocated_by_dev[dev]
                 affected.add(dev)
-                debug(f"[allocate] +{format_bytes(b)} on {dev} (hook)")
+                debug(f"[allocate] [hook] +{format_bytes(b)} on {dev}, now {format_bytes(total_now)}")
                 self._record_site_locked(kind="alloc", dev=dev, bytes_=b, site=caller)
         for dev in affected:
             self._maybe_auto_gc(dev)
@@ -527,9 +550,10 @@ class MemLord:
                 if b <= 0:
                     continue
                 self._allocated_by_dev[dev] = max(0, self._allocated_by_dev.get(dev, 0) - b)
+                total_now = self._allocated_by_dev[dev]
                 self._freed_by_dev[dev] = self._freed_by_dev.get(dev, 0) + b
                 affected.add(dev)
-                debug(f"[free] released {format_bytes(b)} on {dev} (hook)")
+                debug(f"[free] [hook] -{format_bytes(b)} on {dev}, now {format_bytes(total_now)}")
                 self._record_site_locked(kind="free", dev=dev, bytes_=b, site=caller)
         for dev in affected:
             self._maybe_auto_gc(dev)

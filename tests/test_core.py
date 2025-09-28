@@ -378,8 +378,15 @@ def test_logs_include_hook_labels_and_free_and_allocate(capsys):
         t = alloc_tensor_on(d0, (64, 64))
         _ = t.to("cpu")  # CPU alloc (hook) + cuda:0 free (hook)
         out = capsys.readouterr().out
-        assert "[allocate]" in out and "(hook)" in out
-        assert "[free]" in out and "(hook)" in out
+
+        # New format must include bracketed tag and the running total suffix
+        assert "[allocate]" in out and "[hook]" in out and ", now " in out
+        assert "[free]" in out and "[hook]" in out and ", now " in out
+
+        # Keep backward-compat if present (doesn't have to be, but okay if it is)
+        # This makes the test tolerant if logs also include "(hook)" suffix.
+        # Not required:
+        # assert "(hook)" in out
     finally:
         hooks.disable()
         if "DEBUG" in os.environ:
