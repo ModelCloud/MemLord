@@ -221,9 +221,9 @@ class MemLord:
         if strategy is None:
             # Default: thresholds scale with capacity; get stricter as usage climbs.
             strategy = {
-                (0, 50):   {"metric": "max", "threshold": {"percent": 50.0}},
-                (50, 75):  {"metric": "max", "threshold": {"percent": 33.0}},
-                (75, 101): {"metric": "max", "threshold": {"percent": 25.0}},
+                (0, 50):   {"metric": "max", "threshold": {"percent": 33.0}},
+                (50, 75):  {"metric": "max", "threshold": {"percent": 20.0}},
+                (75, 101): {"metric": "max", "threshold": {"percent": 10.0}},
             }
 
         # Light validation
@@ -396,12 +396,19 @@ class MemLord:
         return None
 
     def _resolve_threshold_bytes(self, rule: dict, dev: torch.device) -> int:
+        """
+        Build a byte threshold for the rule.
+        If both 'bytes' and 'percent' are provided, choose the **minimum** of the two
+        (more conservative), instead of the maximum.
+        """
         thr = rule.get("threshold", {})
-        out = 0
+        candidates = []
 
         if "bytes" in thr:
             try:
-                out = max(out, int(thr["bytes"]))
+                b = int(thr["bytes"])
+                if b > 0:
+                    candidates.append(b)
             except Exception:
                 pass
 
@@ -410,11 +417,14 @@ class MemLord:
             if total:
                 try:
                     pct = float(thr["percent"])
-                    out = max(out, int(total * (pct / 100.0)))
+                    if pct > 0:
+                        candidates.append(int(total * (pct / 100.0)))
                 except Exception:
                     pass
 
-        return out
+        if not candidates:
+            return 0
+        return min(candidates)
 
     def _metric_value(self, metric: str, dev: torch.device) -> int:
         if metric == "allocated":
