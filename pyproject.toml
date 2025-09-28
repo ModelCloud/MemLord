@@ -4,14 +4,14 @@ requires = ["setuptools >= 64"]
 [project]
 name = "MemLord"
 version = "0.0.1-dev0"
-description = ""
+description = "MemLord is a tiny, fast PyTorch memory accountant that auto tracks allocated/freed (via torch hooks) bytes per torch.device and device index (e.g., cuda:0, cuda:1, cpu). It features a banded auto-GC strategy, Python finalizers for del, optional call-site tracking, and background device usage polling."
 readme = "README.md"
 requires-python = ">=3.8"
 license-files = ["LICENSE"]
 authors = [
     { name = "ModelCloud", email = "qubitium@modelcloud.ai" },
 ]
-keywords = ["MemLord"]
+keywords = ["MemLord", "memory", "torch", "profiler", "memory profiler", "memory tracker", "tracker", "gc", "cuda", "empty_cache"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",

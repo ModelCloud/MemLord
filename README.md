@@ -1,6 +1,6 @@
 # MemLord
 
-**MemLord** is a tiny, fast PyTorch memory accountant that tracks allocated/freed bytes **per `torch.device` _and_ device index** (e.g., `cuda:0`, `cuda:1`, `cpu`). It now features a **banded auto-GC strategy**, **Python finalizers for `del`**, **optional call-site tracking**, and **background device usage polling** via [`device-smi`](https://github.com/ModelCloud/Device-SMI).
+**MemLord** is a tiny, fast PyTorch memory accountant that tracks allocated/freed bytes **per `torch.device` _and_ device index** (e.g., `cuda:0`, `cuda:1`, `cpu`). It features a **banded auto-GC strategy**, **Python finalizers for `del`**, **optional call-site tracking**, and **background device usage polling** via [`device-smi`](https://github.com/ModelCloud/Device-SMI).
 
 ---
 
