@@ -105,9 +105,9 @@ Example: scale up aggressiveness as memory fills
 
 ```py
 strategy = {
-    (0, 50):   {"metric": "max",   "threshold": {"percent": 50.0}},  # <=50% used
-    (50, 75):  {"metric": "max",   "threshold": {"percent": 33.0}},  # 50-75%
-    (75, 101): {"metric": "freed", "threshold": {"percent": 10.0}},  # >75%
+    (0, 50):   {"metric": "max",   "threshold": {"percent": 50.0}},  # 0 <= used% < 50
+    (50, 75):  {"metric": "max",   "threshold": {"percent": 33.0}},  # 50 <= used% < 75
+    (75, 101): {"metric": "freed", "threshold": {"percent": 10.0}},  # 75 <= used% < 101
 }
 lord = MemLord(auto_gc_strategy=strategy)
 
