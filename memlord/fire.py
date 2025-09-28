@@ -213,6 +213,8 @@ class TorchMoveHooks:
         nn.Module.to = module_to_wrapper     # type: ignore[assignment]
         if self._orig_cuda_synchronize is not None:
             torch.cuda.synchronize = cuda_synchronize_wrapper  # type: ignore[assignment]
+        StreamCls = getattr(torch.cuda, "Stream", None)
+        EventCls  = getattr(torch.cuda, "Event", None)
         if StreamCls is not None and self._orig_stream_synchronize is not None:
             StreamCls.synchronize = stream_synchronize_wrapper  # type: ignore[assignment]
         if EventCls is not None and self._orig_event_synchronize is not None:

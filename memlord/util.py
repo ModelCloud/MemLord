@@ -27,9 +27,17 @@ MAGENTA = "\033[95m"
 def is_debug() -> bool:
     return os.environ.get("DEBUG", "0") == "1"
 
+def _prefix(msg: str) -> str:
+    return f"MemLord: {msg}"
+
 def log(msg: str) -> None:
+    """Debug logging (respects DEBUG env). Always prefixes with 'MemLord: '."""
     if is_debug():
-        print(msg)
+        print(_prefix(msg))
+
+def log_always(msg: str) -> None:
+    """Unconditional logging (ignores DEBUG). Always prefixes with 'MemLord: '."""
+    print(_prefix(msg))
 
 # ---------- Formatters ----------
 def format_bytes(n: int) -> str:

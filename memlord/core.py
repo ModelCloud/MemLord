@@ -12,7 +12,7 @@ import torch.nn as nn
 
 from .util import (
     RESET, RED, GREEN, YELLOW, CYAN, MAGENTA,
-    is_debug, log as _log, format_bytes, best_user_frame,
+    is_debug, log as _log, log_always as _log_always, format_bytes, best_user_frame,
     get_device_mem_stats,  # device-smi based pollers
 )
 from .fire import TorchMoveHooks, run_backend_gc as _run_backend_gc, sum_for_device as _sum_for_device
@@ -375,21 +375,21 @@ class MemLord:
             return
         for dev in all_devices:
             val = per_device_map.get(dev, 0)
-            print(f"{header} {dev}: {format_bytes(val)}")
+            _log(f"{header} {dev}: {format_bytes(val)}")
         for dtype in sorted(type_totals.keys()):
             if type_counts.get(dtype, 0) > 1:
-                print(f"{header} {dtype}: {format_bytes(type_totals[dtype])}")
+                _log(f"{header} {dtype}: {format_bytes(type_totals[dtype])}")
 
     # ---------- Device memory stats ----------
     def _device_memory_stats(self, dev: torch.device) -> Tuple[Optional[int], Optional[int], float]:
         return get_device_mem_stats(dev)
 
     # ---------- Strategy selection & evaluation ----------
-    def _select_rule_for_used_pct(self, used_pct: float) -> Optional[dict]:
+    def _select_rule_for_used_pct(self, used_pct: float) -> Optional[tuple[tuple[float, float], dict]]:
         strat = self._auto_gc_strategy
         for (lo, hi), rule in strat.items():
             if used_pct >= float(lo) and used_pct < float(hi):
-                return rule
+                return (float(lo), float(hi)), rule
         return None
 
     def _resolve_threshold_bytes(self, rule: dict, dev: torch.device) -> int:
@@ -438,9 +438,10 @@ class MemLord:
     # ---------- Auto-GC (per-device, strategy-driven) ----------
     def _maybe_auto_gc(self, dev: torch.device) -> None:
         total_bytes, used_bytes, used_pct = self._device_memory_stats(dev)
-        rule = self._select_rule_for_used_pct(used_pct)
-        if not rule:
+        sel = self._select_rule_for_used_pct(used_pct)
+        if not sel:
             return
+        (band_lo, band_hi), rule = sel
 
         metric = rule.get("metric", "max")
         threshold_bytes = self._resolve_threshold_bytes(rule, dev)
@@ -451,22 +452,47 @@ class MemLord:
         if value < threshold_bytes:
             return
 
+        # Run backend GC
         if _run_backend_gc(dev):
             with self._lock:
+                # Snapshot BEFORE zeroing to include prior counters
+                snap_alloc = dict(self._allocated_by_dev)
+                snap_freed = dict(self._freed_by_dev)
+                snap_gc_counts = dict(self._gc_count_by_dev)
+                all_devs = self._all_known_devices_locked()
+
+                # Update counters post-GC
                 self._allocated_by_dev[dev] = 0
                 self._freed_by_dev[dev] = 0
                 self._gc_count_by_dev[dev] = self._gc_count_by_dev.get(dev, 0) + 1
-                self._gc_total_count += 1
                 per_dev_count = self._gc_count_by_dev[dev]
+                self._gc_total_count += 1
                 total_count = self._gc_total_count
 
-            _log(
+            # Build a point-in-time summary across all known devices
+            lines = []
+            lines.append(
                 f"{YELLOW}[auto_gc]{RESET} {dev}: ran GC "
                 f"(dev_gc_runs={per_dev_count}, global_gc_runs={total_count}); "
-                f"band_used≈{used_pct:.1f}% metric={metric} "
-                f"{format_bytes(value)} >= {format_bytes(threshold_bytes)}; "
-                f"counters reset: allocated=0, freed=0"
+                f"band={band_lo:.0f}–{band_hi:.0f}% used≈{used_pct:.1f}%; "
+                f"metric={metric} value={format_bytes(value)} threshold={format_bytes(threshold_bytes)}"
             )
+
+            # Per-device snapshot lines (allocated/freed from snapshot + live device-smi stats)
+            for d in all_devs:
+                t_bytes, u_bytes, u_pct = self._device_memory_stats(d)
+                a = snap_alloc.get(d, 0)
+                f = snap_freed.get(d, 0)
+                gc_runs = snap_gc_counts.get(d, 0) + (1 if d == dev else 0)
+                tb = "unknown" if t_bytes is None else format_bytes(t_bytes)
+                ub = "unknown" if u_bytes is None else format_bytes(u_bytes)
+                lines.append(
+                    f"  - {d}: allocated={format_bytes(a)}, freed={format_bytes(f)}, "
+                    f"dev_gc_runs={gc_runs}; device_smi(total={tb}, used={ub}, used%={u_pct:.1f}%)"
+                )
+
+            # Always emit the auto-GC event (ignores DEBUG flag)
+            _log_always("\n".join(lines))
 
     # ---------- Finalizer-safe free path ----------
     def _apply_sizes_free_finalizer(self, sizes_by_dev: Dict[torch.device, int]) -> None:
