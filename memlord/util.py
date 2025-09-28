@@ -146,6 +146,13 @@ def get_device_mem_stats(dev: torch.device) -> Tuple[Optional[int], Optional[int
     For CUDA devices, pass a device with a concrete index (e.g., cuda:0).
     """
     key = _devkey_from_torch_device(dev)
+
+    if is_shutting_down():
+        # Do NOT create new pollers during teardown/finalizers.
+        with _stats_lock:
+            tup = _stats.get(key)
+        return (tup[0], tup[1], tup[2]) if tup else (None, None, 0.0)
+
     _ensure_poller(key)
 
     with _stats_lock:
@@ -175,6 +182,7 @@ class DevicePoller:
         # Resolve a device-smi Device handle
         self._dev = Device(key)
         self._total = int(getattr(self._dev, "memory_total"))
+
         # Initialize snapshot so callers see something immediately
         with _stats_lock:
             _stats[self.key] = (self._total, 0, 0.0)

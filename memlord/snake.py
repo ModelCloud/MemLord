@@ -73,18 +73,18 @@ def _sizes_for_object(ob: nn.Module | torch.Tensor) -> Dict[torch.device, int]:
     return _sum_by_dev_dedup(tensors)
 
 
-# ========================== finalizer callback (no cycles) ===========================
+# ========================== finalizer callback (no cycles / no GC) ===================
 
 def _finalize_cb(lord_ref: "weakref.ReferenceType", sizes_by_dev: Dict[torch.device, int]) -> None:
     """
     Runs when the last strong reference to the tracked object is gone.
     Uses a weakref to MemLord to avoid cycles. Uses precomputed size snapshot.
+    IMPORTANT: Do NOT trigger auto-GC or poller work here; only bump counters.
     """
     try:
         lord = lord_ref()
         if lord is not None and sizes_by_dev:
-            # Call the lightweight internal method that updates counters.
-            lord._apply_sizes_free(sizes_by_dev)  # type: ignore[attr-defined]
+            lord._apply_sizes_free_finalizer(sizes_by_dev)  # finalizer-safe path (no GC)
     except Exception:
         # Never raise from finalizers
         pass
@@ -98,7 +98,7 @@ class SnakeHooks:
 
     Features:
       - Wrap common torch factory functions (e.g., torch.empty/zeros/ones/full/tensor/rand/randn)
-      - Optional deeper wrapping for additional producers (left minimal by default)
+      - Optional deeper wrapping for additional producers (kept minimal)
       - Register a weakref.finalize per object with a precomputed size snapshot
       - Avoids atexit participation (fin.atexit = False)
       - Avoids cycles by holding only a weakref to MemLord in finalizers
@@ -110,7 +110,7 @@ class SnakeHooks:
     _FACTORY_FUNCS = [
         "empty", "zeros", "ones", "full",
         "rand", "randn", "tensor",
-        # You can extend this list if desired.
+        # Extend if desired.
     ]
 
     def __init__(self, lord, enable_factory_wrappers: bool = True, enable_deep_autowrap: bool = True) -> None:
@@ -162,7 +162,6 @@ class SnakeHooks:
                 return
             self._seen[ob] = True
         except Exception:
-            # If WeakKeyDictionary doesn't accept (rare types), just continue; duplicate finalizers are unlikely here
             pass
 
         sizes = _sizes_for_object(ob)
@@ -189,11 +188,7 @@ class SnakeHooks:
             setattr(torch, name, wrapper)
 
     def _patch_tensor_methods(self) -> None:
-        """
-        Optionally wrap a couple of tensor instance methods that are known to produce
-        new tensors. We keep this minimal to reduce maintenance risk.
-        """
-        # Example: clone()
+        # Example: clone() -> returns a new tensor
         if hasattr(torch.Tensor, "clone"):
             orig = torch.Tensor.clone
             wrapper = self._wrap_tensor_method(orig)
@@ -201,10 +196,6 @@ class SnakeHooks:
             setattr(torch.Tensor, "clone", wrapper)
 
     def _patch_additional(self) -> None:
-        """
-        Hook a couple of top-level APIs that often create tensors.
-        Keep conservative; extend if you need wider coverage.
-        """
         # Example: torch.arange
         if hasattr(torch, "arange") and callable(getattr(torch, "arange")):
             orig = torch.arange
