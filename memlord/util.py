@@ -4,15 +4,16 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 from __future__ import annotations
+import atexit
 import os
 import threading
 import time
 import traceback
+import weakref
 from typing import Dict, Optional, Tuple
 
 import torch
-# Hard dependency (PyPI/GitHub: modelcloud/device-smi)
-from device_smi import Device
+from device_smi import Device  # hard dependency as requested
 
 # ---------- ANSI COLORS ----------
 RESET   = "\033[0m"
@@ -52,9 +53,8 @@ def best_user_frame() -> Optional[str]:
         for fr in reversed(stack[:-1]):  # exclude this function's own frame
             fn = (fr.filename or "") or ""
             try:
-                import os as _os
-                if this_file and _os.path.exists(fn) and _os.path.exists(this_file):
-                    if _os.path.samefile(fn, this_file):
+                if this_file and os.path.exists(fn) and os.path.exists(this_file):
+                    if os.path.samefile(fn, this_file):
                         continue
             except Exception:
                 pass
@@ -67,172 +67,168 @@ def best_user_frame() -> Optional[str]:
     return None
 
 
-# =================================================================
-#                Per-Device Memory Pollers (device-smi)
-# =================================================================
+# ============================================================================
+# Background device memory polling (CPU and CUDA) using device-smi
+# ============================================================================
 
-# Public polling cadence (seconds). Can be overridden with MEMLORD_MEM_POLL_MS.
-_POLL_INTERVAL_SEC_DEFAULT = 0.200  # 200 ms
-try:
-    _POLL_INTERVAL_SEC = float(int(os.environ.get("MEMLORD_MEM_POLL_MS", "200"))) / 1000.0
-except Exception:
-    _POLL_INTERVAL_SEC = _POLL_INTERVAL_SEC_DEFAULT
+# Poll cadence (seconds). Can override with MEMLORD_POLL_INTERVAL_MS=integer
+_POLL_INTERVAL = max(0.01, float(os.environ.get("MEMLORD_POLL_INTERVAL_MS", "200")) / 1000.0)
 
-# Thread-safe cache: { torch.device -> (total_bytes, used_bytes, used_pct) }
-_mem_cache: Dict[torch.device, Tuple[Optional[int], Optional[int], float]] = {}
-_cache_lock = threading.Lock()
+# Global shutdown coordination
+_SHUTTING_DOWN = False
+_shutdown_lock = threading.Lock()
 
-# Device handles and workers
-_device_handles: Dict[torch.device, Device] = {}
-_workers_started = False
-_workers_lock = threading.Lock()
+# Track active SnakeHooks (weakly) so atexit can disable them before weakref.finalize pass
+_active_snake_hooks: "weakref.WeakSet" = weakref.WeakSet()
 
+# Per-device pollers and stats
+_pollers_lock = threading.Lock()
+_pollers: Dict[str, "DevicePoller"] = {}
 
-def _mk_cuda_key(idx: int) -> str:
-    # device-smi naming convention for CUDA adapters
-    return f"cuda:{idx}"
+_stats_lock = threading.Lock()
+# key -> (total_bytes, used_bytes, used_pct)
+_stats: Dict[str, Tuple[int, int, float]] = {}
 
 
-def _register_cpu_if_needed() -> None:
-    global _device_handles
-    td = torch.device("cpu")
-    if td in _device_handles:
-        return
-    # Initialize CPU handle & cache with total capacity
-    cpu = Device("cpu")
-    total = int(cpu.memory_total)
-    with _cache_lock:
-        _device_handles[td] = cpu
-        _mem_cache[td] = (total, 0, 0.0)
+def is_shutting_down() -> bool:
+    return _SHUTTING_DOWN
 
 
-def _register_cuda_if_needed() -> None:
-    global _device_handles
-    if not torch.cuda.is_available():
-        return
-    try:
-        n = torch.cuda.device_count()
-    except Exception:
-        n = 0
-    for idx in range(n):
-        td = torch.device("cuda", idx)
-        if td in _device_handles:
-            continue
-        key = _mk_cuda_key(idx)
-        try:
-            h = Device(key)
-            total = int(h.memory_total)
-        except Exception:
-            # Skip this CUDA adapter if not visible to device-smi
-            continue
-        with _cache_lock:
-            _device_handles[td] = h
-            _mem_cache[td] = (total, 0, 0.0)
-
-
-def _poller_loop(td: torch.device, handle: Device, interval_sec: float) -> None:
+def register_snake_hooks_instance(hook_obj) -> None:
     """
-    Dedicated thread per device. Refreshes live metrics at the given cadence.
+    Keep a weak reference to active SnakeHooks so we can disable/unwrap at exit.
+    Does not create cycles.
     """
-    name = f"memlord-poller-{td.type}{'' if td.index is None else ':' + str(td.index)}"
     try:
-        threading.current_thread().name = name  # cosmetic
+        _active_snake_hooks.add(hook_obj)
     except Exception:
         pass
 
-    # Ensure cache has total capacity on first tick
-    with _cache_lock:
-        current = _mem_cache.get(td)
-        if not current or current[0] is None:
-            try:
-                total = int(handle.memory_total)
-            except Exception:
-                total = None
-            _mem_cache[td] = (total, 0, 0.0)
 
-    while True:
-        try:
-            # Refresh live stats
-            handle.metrics()
-            used = int(handle.memory_used())
-
-            with _cache_lock:
-                total = _mem_cache.get(td, (None, None, 0.0))[0]
-                if total is None:
-                    try:
-                        total = int(handle.memory_total)
-                    except Exception:
-                        total = None
-                pct = (used / total * 100.0) if (total and total > 0) else 0.0
-                _mem_cache[td] = (total, used, pct)
-        except Exception:
-            # Keep the last good values; try again next tick
-            pass
-
-        time.sleep(interval_sec)
+def _devkey_from_torch_device(dev: torch.device) -> str:
+    if dev.type == "cpu":
+        return "cpu"
+    if dev.type == "cuda":
+        idx = dev.index if dev.index is not None else 0
+        return f"cuda:{idx}"
+    # Fallback: stringify
+    if dev.index is None:
+        return dev.type
+    return f"{dev.type}:{dev.index}"
 
 
-def _start_workers_if_needed() -> None:
-    global _workers_started
-    if _workers_started:
-        return
-    with _workers_lock:
-        if _workers_started:
+def _ensure_poller(key: str) -> None:
+    with _pollers_lock:
+        if key in _pollers:
             return
+        poller = DevicePoller(key)
+        _pollers[key] = poller
+        poller.start()
 
-        # Register CPU and CUDA devices
-        _register_cpu_if_needed()
-        _register_cuda_if_needed()
 
-        # Spawn one daemon thread per device
-        with _cache_lock:
-            items = list(_device_handles.items())
-        for td, handle in items:
-            t = threading.Thread(
-                target=_poller_loop,
-                args=(td, handle, _POLL_INTERVAL_SEC),
-                daemon=True,
-            )
-            t.start()
-
-        _workers_started = True
-        if is_debug():
-            log(f"{YELLOW}[memlord]{RESET} started {len(items)} per-device poller thread(s) @ {int(_POLL_INTERVAL_SEC*1000)} ms")
+def _stop_all_device_pollers() -> None:
+    with _pollers_lock:
+        ps = list(_pollers.values())
+    for p in ps:
+        p.stop()
+    for p in ps:
+        p.join(timeout=1.0)
+    with _pollers_lock:
+        _pollers.clear()
 
 
 def get_device_mem_stats(dev: torch.device) -> Tuple[Optional[int], Optional[int], float]:
     """
-    Return (total_bytes, used_bytes, used_pct) for the given torch.device from the
-    background per-device poller cache. Starts workers lazily on first use and
-    auto-registers devices discovered later (e.g., after CUDA init).
+    Returns (total_bytes, used_bytes, used_pct) for the given device, based on
+    the latest snapshot from the background poller. If the poller hasn't run
+    yet, best-effort values (possibly zeros) are returned.
+
+    For CUDA devices, pass a device with a concrete index (e.g., cuda:0).
     """
-    # Ensure pollers are running
-    _start_workers_if_needed()
+    key = _devkey_from_torch_device(dev)
+    _ensure_poller(key)
 
-    # If a new device appears later (rare), register its worker lazily
-    if dev not in _device_handles:
-        try:
-            if dev.type == "cpu":
-                _register_cpu_if_needed()
-            elif dev.type == "cuda":
-                # Register all visible CUDA devices; cheap if repeated
-                _register_cuda_if_needed()
-                # If still not present, try to bind this index specifically
-                if dev not in _device_handles and dev.index is not None:
-                    key = _mk_cuda_key(int(dev.index))
-                    h = Device(key)  # may raise; let it bubble to the except
-                    total = int(h.memory_total)
-                    with _cache_lock:
-                        _device_handles[dev] = h
-                        _mem_cache[dev] = (total, 0, 0.0)
-                    # Spawn its worker
-                    t = threading.Thread(
-                        target=_poller_loop, args=(dev, h, _POLL_INTERVAL_SEC), daemon=True
-                    )
-                    t.start()
-        except Exception:
-            # Leave missing; return empty stats for now
-            pass
+    with _stats_lock:
+        tup = _stats.get(key)
 
-    with _cache_lock:
-        return _mem_cache.get(dev, (None, None, 0.0))
+    if tup is None:
+        return (None, None, 0.0)
+
+    total, used, pct = tup
+    return (total, used, pct)
+
+
+class DevicePoller:
+    """
+    One poller per device key (e.g., "cpu", "cuda:0"). Reads memory_total once,
+    then samples memory_used() roughly every _POLL_INTERVAL seconds.
+
+    device-smi notes:
+      - CPU:   Device("cpu")        -> .memory_total, .memory_used()
+      - CUDA:  Device("cuda:IDX")   -> .memory_total, .memory_used()
+    """
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self._stop_evt = threading.Event()
+        self._thr = threading.Thread(target=self._run, name=f"memlord-poller-{key}", daemon=True)
+
+        # Resolve a device-smi Device handle
+        self._dev = Device(key)
+        self._total = int(getattr(self._dev, "memory_total"))
+        # Initialize snapshot so callers see something immediately
+        with _stats_lock:
+            _stats[self.key] = (self._total, 0, 0.0)
+
+    def start(self) -> None:
+        self._thr.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        self._thr.join(timeout=timeout)
+
+    def _run(self) -> None:
+        # Tight loop sampling memory_used() until asked to stop
+        iv = _POLL_INTERVAL
+        while not self._stop_evt.is_set():
+            try:
+                used = int(self._dev.memory_used())  # JIT/instant used value
+            except Exception:
+                used = 0
+            pct = (float(used) / float(self._total) * 100.0) if self._total > 0 else 0.0
+            with _stats_lock:
+                _stats[self.key] = (self._total, used, pct)
+            # Wait with interruptible sleep
+            self._stop_evt.wait(iv)
+
+
+# ============================================================================
+# atexit cleanup: stop pollers and disable SnakeHooks before weakref.finalize
+# ============================================================================
+
+def _memlord_atexit_cleanup():
+    global _SHUTTING_DOWN
+    with _shutdown_lock:
+        if _SHUTTING_DOWN:
+            return
+        _SHUTTING_DOWN = True
+
+    # 1) Stop background pollers first (prevents late memory_used calls)
+    try:
+        _stop_all_device_pollers()
+    except Exception:
+        pass
+
+    # 2) Disable active SnakeHooks (unwrap torch so no more finalizers are registered)
+    try:
+        for h in list(_active_snake_hooks):
+            try:
+                h.disable()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# Register now; atexit runs handlers in LIFO order.
+atexit.register(_memlord_atexit_cleanup)

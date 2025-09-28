@@ -13,10 +13,10 @@ import torch.nn as nn
 from .util import (
     RESET, RED, GREEN, YELLOW, CYAN, MAGENTA,
     is_debug, log as _log, format_bytes, best_user_frame,
-    get_device_mem_stats,  # background per-device stats
+    get_device_mem_stats,  # background per-device stats (via device-smi pollers)
 )
 from .fire import TorchMoveHooks, run_backend_gc as _run_backend_gc, sum_for_device as _sum_for_device
-from .snake import SnakeHooks  # Python-level GC hooks
+from .snake import SnakeHooks  # Python-level GC/finalizer hooks
 
 
 # ---------- TYPE ALIASES ----------
@@ -37,10 +37,13 @@ Strategy shape:
             "threshold": {
                 "bytes":   int,     # absolute threshold in bytes
                 "percent": float,   # percent of device capacity (VRAM on GPU, RAM on CPU)
-            }
+            },
+            # Optional (if you extend): "cooldown_ms": int, "hysteresis_pct": float
         },
         ...
     }
+
+Band selection is half-open: lo <= used_pct < hi, so (0,50),(50,75),(75,101) are non-overlapping.
 """
 
 
@@ -442,7 +445,11 @@ class MemLord:
 
         if _run_backend_gc(dev):
             with self._lock:
+                # *** As requested: reset BOTH counters for this device after a GC ***
+                self._allocated_by_dev[dev] = 0
                 self._freed_by_dev[dev] = 0
+
+                # Update GC counters
                 self._gc_count_by_dev[dev] = self._gc_count_by_dev.get(dev, 0) + 1
                 self._gc_total_count += 1
                 per_dev_count = self._gc_count_by_dev[dev]
@@ -450,9 +457,10 @@ class MemLord:
 
             _log(
                 f"{YELLOW}[auto_gc]{RESET} {dev}: ran GC "
-                f"(count={per_dev_count}), total across devices={total_count}; "
+                f"(dev_gc_runs={per_dev_count}, global_gc_runs={total_count}); "
                 f"band_used≈{used_pct:.1f}% metric={metric} "
-                f"{format_bytes(value)} >= {format_bytes(threshold_bytes)}"
+                f"{format_bytes(value)} >= {format_bytes(threshold_bytes)}; "
+                f"counters reset: allocated=0, freed=0"
             )
 
     # ---- Internal helpers used by TorchMoveHooks and Python finalizers ----
