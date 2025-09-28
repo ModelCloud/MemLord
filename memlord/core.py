@@ -13,10 +13,10 @@ import torch.nn as nn
 from .util import (
     RESET, RED, GREEN, YELLOW, CYAN, MAGENTA,
     is_debug, log as _log, format_bytes, best_user_frame,
-    get_device_mem_stats,  # background per-device stats
+    get_device_mem_stats,           # background per-device stats (via device-smi pollers)
 )
 from .fire import TorchMoveHooks, run_backend_gc as _run_backend_gc, sum_for_device as _sum_for_device
-from .snake import SnakeHooks  # Python-level GC hooks
+from .snake import SnakeHooks  # Python-level GC/finalizer hooks
 
 
 # ---------- TYPE ALIASES ----------
@@ -37,10 +37,13 @@ Strategy shape:
             "threshold": {
                 "bytes":   int,     # absolute threshold in bytes
                 "percent": float,   # percent of device capacity (VRAM on GPU, RAM on CPU)
-            }
+            },
+            # (Optionally extend in the future: "cooldown_ms": int, "hysteresis_pct": float)
         },
         ...
     }
+
+Band selection is half-open: lo <= used_pct < hi, so (0,50),(50,75),(75,101) are non-overlapping.
 """
 
 
@@ -89,6 +92,9 @@ class MemLord:
 
         # Call-site tracking flag (disabled by default)
         self._track_callsite: bool = bool(track_callsite)
+
+        # Optional per-thread flag to identify finalizer context (not strictly required now)
+        self._in_finalizer_local = threading.local()
 
     # ---------- Public API ----------
     def set_callsite_tracking(self, enabled: bool) -> None:
@@ -440,9 +446,14 @@ class MemLord:
         if value < threshold_bytes:
             return
 
+        # IMPORTANT: do not hold self._lock across backend GC calls
         if _run_backend_gc(dev):
             with self._lock:
+                # Reset BOTH counters after a GC to prevent immediate re-trigger loops.
+                self._allocated_by_dev[dev] = 0
                 self._freed_by_dev[dev] = 0
+
+                # Update GC counters
                 self._gc_count_by_dev[dev] = self._gc_count_by_dev.get(dev, 0) + 1
                 self._gc_total_count += 1
                 per_dev_count = self._gc_count_by_dev[dev]
@@ -450,10 +461,29 @@ class MemLord:
 
             _log(
                 f"{YELLOW}[auto_gc]{RESET} {dev}: ran GC "
-                f"(count={per_dev_count}), total across devices={total_count}; "
+                f"(dev_gc_runs={per_dev_count}, global_gc_runs={total_count}); "
                 f"band_used≈{used_pct:.1f}% metric={metric} "
-                f"{format_bytes(value)} >= {format_bytes(threshold_bytes)}"
+                f"{format_bytes(value)} >= {format_bytes(threshold_bytes)}; "
+                f"counters reset: allocated=0, freed=0"
             )
+
+    # ---------- Finalizer-safe free path ----------
+    def _apply_sizes_free_finalizer(self, sizes_by_dev: Dict[torch.device, int]) -> None:
+        """
+        Finalizer-safe free path:
+          - updates counters only
+          - NO call-site capture
+          - NO auto-GC
+          - minimal work (finalizers run at delicate times)
+        """
+        if not sizes_by_dev:
+            return
+        with self._lock:
+            for dev, b in sizes_by_dev.items():
+                if b <= 0:
+                    continue
+                self._allocated_by_dev[dev] = max(0, self._allocated_by_dev.get(dev, 0) - b)
+                self._freed_by_dev[dev] = self._freed_by_dev.get(dev, 0) + b
 
     # ---- Internal helpers used by TorchMoveHooks and Python finalizers ----
     def _apply_sizes_allocate(self, sizes_by_dev: Dict[torch.device, int]) -> None:
@@ -478,7 +508,7 @@ class MemLord:
 
     def _apply_sizes_free(self, sizes_by_dev: Dict[torch.device, int]) -> None:
         """
-        Called by TorchMoveHooks and Python finalizers when memory is freed.
+        Called by TorchMoveHooks when memory is freed (including flush of deferred frees).
         Updates internal counters and evaluates auto-GC.
         """
         if not sizes_by_dev:
