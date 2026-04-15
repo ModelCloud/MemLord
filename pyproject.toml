@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools >= 64"]
+requires = ["setuptools>=77.0.1,<83"]
 
 [project]
 name = "MemLord"
@@ -7,7 +7,7 @@ version = "0.0.1-dev0"
 description = "MemLord is a tiny, fast PyTorch memory accountant that auto tracks allocated/freed (via torch hooks) bytes per torch.device and device index (e.g., cuda:0, cuda:1, cpu). It features a banded auto-GC strategy, Python finalizers for del, optional call-site tracking, and background device usage polling."
 readme = "README.md"
 requires-python = ">=3.8"
-license-files = ["LICENSE"]
+license = "Apache-2.0"
 authors = [
     { name = "ModelCloud", email = "qubitium@modelcloud.ai" },
 ]
